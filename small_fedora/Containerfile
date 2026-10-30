@@ -1,0 +1,116 @@
+# Small Fedora rootfs, built FROM scratch (see ../small_fedora.md).
+#
+# Stage 1 installs an explicit package list into an empty /rootfs with
+# dnf --installroot (no @core, no weak deps, no docs), configures it, and
+# builds a generic initramfs. Stage 2 is just that rootfs.
+#
+# The image is NOT a runnable container — it is the input to build-disk.sh,
+# which turns it into a bootable GPT disk. The ESP contents (systemd-boot,
+# kernel, initramfs, loader entry) are staged under /efi in the image.
+#
+# Build (role packages via --build-arg EXTRA_PACKAGES="..."):
+#   podman build --platform linux/amd64 -t localhost/small-fedora-rootfs small_fedora/
+
+ARG FEDORA_VER=44
+
+FROM registry.fedoraproject.org/fedora:${FEDORA_VER} AS builder
+ARG FEDORA_VER
+
+# Base OS. Role packages (nodejs, postgresql-server, avahi, ...) go in
+# EXTRA_PACKAGES so the base can be measured on its own.
+ARG BASE_PACKAGES="\
+    kernel-core \
+    systemd systemd-udev systemd-networkd systemd-resolved \
+    systemd-boot-unsigned dracut \
+    dbus-broker util-linux-core coreutils-single iproute \
+    openssh-server qemu-guest-agent \
+    glibc-minimal-langpack"
+ARG EXTRA_PACKAGES=""
+ARG GUEST_PASSWORD=openshift
+ARG GUEST_HOSTNAME=portable-fedora
+
+# dracut config + kernel-install masks must exist BEFORE kernel-core installs:
+# its scriptlet runs kernel-install, and we don't want it generating a
+# host-only initramfs or writing boot entries. We build the initramfs ourselves.
+COPY dracut.conf /rootfs/etc/dracut.conf.d/50-small-fedora.conf
+RUN mkdir -p /rootfs/etc/kernel/install.d \
+    && ln -s /dev/null /rootfs/etc/kernel/install.d/50-dracut.install \
+    && ln -s /dev/null /rootfs/etc/kernel/install.d/90-loaderentry.install \
+    && ln -s /dev/null /rootfs/etc/kernel/install.d/90-uki-copy.install
+
+RUN dnf --installroot=/rootfs --releasever=${FEDORA_VER} --use-host-config \
+        --setopt=install_weak_deps=False --setopt=tsflags=nodocs \
+        install -y ${BASE_PACKAGES} ${EXTRA_PACKAGES} \
+    && dnf --installroot=/rootfs clean all \
+    && rm -rf /rootfs/var/cache/* /rootfs/var/log/* /rootfs/var/lib/dnf
+
+# --- System config ---
+# Empty machine-id + no SSH host keys: both are generated on first boot, so
+# every clone is unique. (build-disk.sh rewrites the root fstab line per FS_TYPE.)
+COPY 20-wired.network /rootfs/etc/systemd/network/20-wired.network
+COPY journald.conf /rootfs/etc/systemd/journald.conf.d/50-small-fedora.conf
+RUN echo "${GUEST_HOSTNAME}" > /rootfs/etc/hostname \
+    && : > /rootfs/etc/machine-id \
+    && printf 'LABEL=fedora-root  /     btrfs  compress=zstd:1   0 0\nLABEL=ESP          /efi  vfat   umask=0077,nofail 0 2\n' \
+        > /rootfs/etc/fstab \
+    && mkdir -p /rootfs/efi \
+    && ln -sf ../run/systemd/resolve/stub-resolv.conf /rootfs/etc/resolv.conf \
+    && printf 'PermitRootLogin yes\nPasswordAuthentication yes\n' \
+        > /rootfs/etc/ssh/sshd_config.d/50-root-login.conf \
+    && echo "root:${GUEST_PASSWORD}" | chpasswd -R /rootfs \
+    && chroot /rootfs systemctl set-default multi-user.target \
+    && chroot /rootfs systemctl enable sshd systemd-networkd systemd-resolved \
+    && chroot /rootfs systemctl mask systemd-firstboot.service
+
+# --- ESP staging (/rootfs/efi is copied to the ESP, not the root fs) ---
+# kernel-core's scriptlets already ran dracut during the install, using our
+# generic dracut.conf, so the initramfs is in /rootfs/boot — just move it.
+COPY loader.conf /rootfs/efi/loader/loader.conf
+RUN set -e; \
+    KVER=$(ls /rootfs/usr/lib/modules | head -1); \
+    test -s /rootfs/boot/initramfs-${KVER}.img; \
+    chroot /rootfs lsinitrd /boot/initramfs-${KVER}.img | grep -E '\.ko'; \
+    mkdir -p /rootfs/efi/EFI/BOOT /rootfs/efi/loader/entries; \
+    mv /rootfs/boot/initramfs-${KVER}.img /rootfs/efi/initramfs.img; \
+    rm -f /rootfs/boot/symvers-*; \
+    cp /rootfs/usr/lib/systemd/boot/efi/systemd-bootx64.efi /rootfs/efi/EFI/BOOT/BOOTX64.EFI; \
+    cp /rootfs/usr/lib/modules/${KVER}/vmlinuz /rootfs/efi/vmlinuz; \
+    printf 'title   Fedora %s (small)\nlinux   /vmlinuz\ninitrd  /initramfs.img\noptions root=LABEL=fedora-root rw net.ifnames=0 console=tty0 console=ttyS0,115200\n' \
+        "${FEDORA_VER}" > /rootfs/efi/loader/entries/fedora.conf; \
+    ls -la /rootfs/efi
+
+# --- Strip: drop everything a running VM doesn't need ---
+# Kernel modules: keep-list + dependencies (see prune-modules.sh). Storage and
+# filesystem drivers the root disk needs are built into Fedora's kernel; these
+# are the modules for legacy infrastructure + KVM/CNV devices.
+ARG KEEP_MODULES="\
+    virtio_scsi vmw_pvscsi nvme \
+    virtio_net vmxnet3 e1000 e1000e \
+    virtio_console virtio_balloon virtio_rng virtio_input \
+    vmw_vmci vmw_balloon vmw_vsock_vmci_transport \
+    vfat nls_cp437 nls_iso8859-1 nls_utf8 \
+    usbhid hid_generic"
+COPY prune-modules.sh /usr/local/bin/prune-modules.sh
+RUN set -e; \
+    KVER=$(ls /rootfs/usr/lib/modules | head -1); \
+    K=/rootfs/usr/lib/modules/${KVER}; \
+    prune-modules.sh /rootfs "${KVER}" ${KEEP_MODULES}; \
+    rm -f "${K}/vmlinuz" "${K}/.vmlinuz.hmac" "${K}/System.map" "${K}/symvers.xz"; \
+    # kbd (loadkeys/setfont) is removed below — serial/VM consoles do not need it
+    chroot /rootfs systemctl mask systemd-vconsole-setup.service systemd-oomd.service systemd-oomd.socket; \
+    rm -f /rootfs/usr/lib/udev/rules.d/90-vconsole.rules; \
+    # Build-only packages (initramfs + bootloader are already staged in /efi)
+    rpm --root /rootfs -e --nodeps --noscripts \
+        $(rpm --root /rootfs -q dracut systemd-boot-unsigned kbd kbd-misc kbd-legacy 2>/dev/null | grep -v 'not installed'); \
+    # No rpm/dnf in the image, so the package DB is dead weight — keep a list instead
+    mkdir -p /rootfs/usr/share/small-fedora; \
+    rpm --root /rootfs -qa --qf '%{NAME}-%{VERSION}-%{RELEASE}.%{ARCH}\n' | sort \
+        > /rootfs/usr/share/small-fedora/packages.txt; \
+    rm -rf /rootfs/usr/lib/sysimage/rpm /rootfs/var/lib/rpm; \
+    # hwdb text (never compiled to hwdb.bin), translations, man pages
+    rm -rf /rootfs/usr/lib/udev/hwdb.d/* /rootfs/usr/share/locale/* \
+           /rootfs/usr/share/man /rootfs/usr/share/info /rootfs/boot/*; \
+    du -sm --exclude=/rootfs/efi /rootfs /rootfs/efi
+
+FROM scratch
+COPY --from=builder /rootfs /
