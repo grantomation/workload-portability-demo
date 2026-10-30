@@ -70,6 +70,42 @@ remain to be verified for the chosen environment. S3, cloud storage credentials
 and licensing are needed for their associated management/storage stages, not
 simply to start building and testing VM images.
 
+### Create the S3 bucket and access keys
+
+Use an S3 endpoint reachable over HTTPS by all participating clusters. Access to
+the bucket is authenticated using an access key ID and secret access key;
+anonymous public access is not required. Keep S3 Block Public Access enabled.
+
+For an AWS S3 setup:
+
+1. In the S3 console, create a general-purpose bucket with a unique name in your
+   chosen region. Keep Block Public Access enabled and ACLs disabled. Retain the
+   default S3-managed encryption for this basic setup.
+2. In IAM, create a dedicated user for this demo's object-storage access. Console
+   sign-in is not needed. Attach a policy allowing bucket listing and location
+   lookup, object read/write/delete, and multipart upload operations for this
+   bucket. Scope bucket and object permissions to its bucket ARN and object ARN
+   (`arn:aws:s3:::YOUR_BUCKET` and `arn:aws:s3:::YOUR_BUCKET/*`). These are data
+   access permissions; an anonymous/public bucket policy is not needed.
+3. Create an access key for that user under Security credentials. Save the access
+   key ID and secret access key securely; the secret is shown only at creation.
+   The current dashboard uses static keys, with no STS session-token field.
+4. Record the bucket name, region and regional endpoint hostname, for example
+   `s3.us-east-1.amazonaws.com`. Use the endpoint matching your chosen region.
+   The bucket name is entered separately, not appended to the endpoint.
+5. Ensure the participating clusters can resolve the endpoint and reach it on
+   HTTPS port 443. Enter the settings in step 3 below before installing ACM or
+   creating Portworx DR pairs.
+
+Portworx uses this bucket to sync data between clusters for subsequent failover.
+The current dashboard also supplies the same bucket and keys to ACM observability;
+there are not separate S3 settings for the two consumers. Saving the settings does
+not test bucket access. Check observability health and DR pair/replication status
+when those components are configured, and confirm successful sync before failover.
+
+Keep the keys out of Git, documentation and distributable VM images. S3 setup can
+wait while you build and test the VMs on the first cluster.
+
 ## 2. Deploy the installation dashboard to the Build cluster
 
 From the root of a published Git clone, with `oc`, Git, Python 3, Bash and OpenSSL:
@@ -98,6 +134,24 @@ settings rather than editing or committing files in this repository.
 Choose the cluster display/load-balancer order deliberately: it also determines
 the Portworx replication chain. Runtime configuration is stored in Kubernetes
 Secrets. A single environment-file import workflow is not implemented yet.
+
+### Enter the S3 settings in the dashboard
+
+Open the **S3 Bucket** settings and fill in:
+
+| Field | Value |
+|-------|-------|
+| Bucket Name | The bucket created in step 1 |
+| Region | The bucket's region |
+| Endpoint | Regional hostname, such as `s3.us-east-1.amazonaws.com`, without a bucket path |
+| Access Key ID | The dedicated user's access key ID |
+| Secret Access Key | Its matching secret access key |
+
+Save before assigning the ACM role or creating DR pairs. The dashboard stores
+these runtime settings in its Kubernetes configuration Secret and supplies them
+to the generated resources. It does not create the bucket or IAM user. See
+[Create the S3 bucket and access keys](#create-the-s3-bucket-and-access-keys)
+for preparation. Build-only work can proceed without these settings.
 
 ## 4. Assign roles and complete configuration
 

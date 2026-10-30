@@ -1,5 +1,10 @@
 # Portworx disaster recovery
 
+For bucket creation, access keys and dashboard entry, follow the
+[S3 setup instructions](setup-runbook.md#create-the-s3-bucket-and-access-keys).
+The endpoint must be reachable by participating clusters; bucket access uses
+credentials, not anonymous public access.
+
 After the initial transfer to OpenShift, Portworx asynchronous DR replicates VM
 storage and Kubernetes resources between spokes. The ACM hub hosts Portworx
 Multi-Cluster and the DR custom resources; storage spokes run Portworx Enterprise.

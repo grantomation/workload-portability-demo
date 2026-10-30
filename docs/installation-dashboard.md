@@ -1,5 +1,10 @@
 # Installation dashboard
 
+For bucket creation, access keys and dashboard entry, follow the
+[S3 setup instructions](setup-runbook.md#create-the-s3-bucket-and-access-keys).
+The endpoint must be reachable by participating clusters; bucket access uses
+credentials, not anonymous public access.
+
 The dashboard registers existing environments, installs operators, applies storage
 configuration, starts Tekton pipelines, and exposes DR controls. It does not
 provision clusters or automatically create the legacy source Provider in MTV.
