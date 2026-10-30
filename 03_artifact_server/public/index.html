@@ -1,0 +1,337 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Workload Portability - Artifact Server</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+      background: #1a1a2e; color: #e0e0e0; padding: 2rem;
+    }
+    h1 { color: #00d4aa; margin-bottom: 0.25rem; font-size: 1.5rem; }
+    .subtitle { color: #888; margin-bottom: 2rem; font-size: 0.9rem; }
+    .columns { display: grid; grid-template-columns: 1fr 1fr; gap: 2rem; }
+    @media (max-width: 900px) { .columns { grid-template-columns: 1fr; } }
+    .panel {
+      background: #16213e; border-radius: 8px; padding: 1.5rem;
+      border: 1px solid #0f3460; margin-bottom: 1.5rem;
+    }
+    .panel h2 { color: #00d4aa; font-size: 1.1rem; margin-bottom: 1rem; }
+    .panel h3 { color: #ccc; font-size: 0.95rem; margin: 1rem 0 0.5rem; }
+    .section-label {
+      color: #00d4aa; font-size: 0.75rem; text-transform: uppercase;
+      letter-spacing: 0.05em; padding: 0.75rem 0.5rem 0.25rem;
+      border-bottom: 1px solid #0f3460; font-weight: 600;
+    }
+
+    /* File table */
+    .file-table { width: 100%; border-collapse: collapse; }
+    .file-table th {
+      text-align: left; padding: 0.5rem; border-bottom: 1px solid #0f3460;
+      color: #888; font-size: 0.8rem; text-transform: uppercase;
+    }
+    .file-table td { padding: 0.4rem 0.5rem; border-bottom: 1px solid #0a1628; }
+    .file-table tr:last-child td { border-bottom: none; }
+    .file-table .name a { color: #4da6ff; text-decoration: none; }
+    .file-table .name a:hover { text-decoration: underline; }
+    .file-table .size { color: #888; text-align: right; white-space: nowrap; }
+    .file-table .date { color: #666; font-size: 0.85rem; }
+    .file-table .actions { text-align: right; }
+    .file-table .format { color: #666; font-size: 0.8rem; }
+    .empty { color: #666; padding: 1.5rem; text-align: center; font-size: 0.9rem; }
+    .missing { color: #555; font-style: italic; font-size: 0.85rem; padding: 0.4rem 0.5rem; }
+
+    .btn-delete {
+      background: none; border: 1px solid #c0392b; color: #e74c3c;
+      padding: 0.2rem 0.5rem; border-radius: 4px; cursor: pointer;
+      font-size: 0.75rem;
+    }
+    .btn-delete:hover { background: #c0392b; color: #fff; }
+
+    /* Upload area */
+    .upload-area {
+      border: 2px dashed #0f3460; border-radius: 8px; padding: 2rem;
+      text-align: center; cursor: pointer; transition: all 0.2s;
+    }
+    .upload-area:hover, .upload-area.dragover {
+      border-color: #00d4aa; background: rgba(0, 212, 170, 0.05);
+    }
+    .upload-area p { margin: 0.5rem 0; }
+    .upload-area .browse { color: #4da6ff; text-decoration: underline; cursor: pointer; }
+    .upload-area input[type="file"] { display: none; }
+
+    .progress-bar {
+      width: 100%; height: 4px; background: #0f3460; border-radius: 2px;
+      margin-top: 1rem; display: none; overflow: hidden;
+    }
+    .progress-bar .fill {
+      height: 100%; background: #00d4aa; width: 0%; transition: width 0.3s;
+    }
+    .upload-status {
+      margin-top: 0.5rem; font-size: 0.85rem; color: #888; min-height: 1.2em;
+    }
+
+    /* Info panel */
+    .info { font-size: 0.85rem; line-height: 1.6; }
+    .info p { margin-bottom: 0.75rem; }
+    .info code {
+      background: #0f3460; padding: 0.15rem 0.4rem; border-radius: 3px;
+      font-size: 0.8rem; color: #4da6ff;
+    }
+    .info ol { padding-left: 1.5rem; margin-bottom: 0.75rem; }
+    .info li { margin-bottom: 0.25rem; }
+    .tag {
+      display: inline-block; padding: 0.15rem 0.5rem; border-radius: 3px;
+      font-size: 0.75rem; font-weight: 600;
+    }
+    .tag-required { background: #c0392b33; color: #e74c3c; border: 1px solid #c0392b; }
+    .tag-auto { background: #16a08533; color: #2ecc71; border: 1px solid #16a085; }
+    .tag-uploaded { background: #2980b933; color: #4da6ff; border: 1px solid #2980b9; }
+  </style>
+</head>
+<body>
+  <h1>Workload Portability - Artifact Server</h1>
+  <p class="subtitle">VM images and Legacy Infra assets for the Workload Portability platform</p>
+
+  <div class="columns">
+    <div>
+      <div class="panel">
+        <h2>Artifacts</h2>
+        <div id="file-list"><p class="empty">Loading...</p></div>
+      </div>
+
+      <div class="panel">
+        <h2>Upload</h2>
+        <div class="upload-area" id="upload-area">
+          <p>Drag and drop a file here</p>
+          <p>or <span class="browse" id="browse-btn">browse</span></p>
+          <input type="file" id="file-input">
+        </div>
+        <div class="progress-bar" id="progress-bar"><div class="fill" id="progress-fill"></div></div>
+        <div class="upload-status" id="upload-status"></div>
+      </div>
+    </div>
+
+    <div>
+      <div class="panel">
+        <h2>Legacy Infra Assets</h2>
+        <div class="info">
+          <p>Upload compatible, user-supplied components for your configured virtualization
+          provider, then run the additional migration components pipeline.</p>
+
+          <h3>Additional Migration Components <span class="tag tag-required">Provider integration</span></h3>
+          <p>These proprietary components are not included in this repository.
+          Obtain a compatible Linux archive from its supplier under the applicable license terms.</p>
+          <ol>
+            <li>Obtain the archive required by your provider integration</li>
+            <li>Keep the archive contents unchanged; the filename must match <code>*.tar.gz</code>. The build preserves the complete directory layout.</li>
+            <li>Upload one <code>*.tar.gz</code> component archive here. If several are present, remove the extras before building.</li>
+          </ol>
+
+          <h3>Management CA Certificate <span class="tag tag-required">Required for MTV</span></h3>
+          <p>TLS certificate for trusted connections to the legacy virtualization API.</p>
+          <ol>
+            <li>Browse to <code>https://&lt;manager-host&gt;/certs/download.zip</code></li>
+            <li>Extract the zip and find the CA certificate (usually in <code>certs/lin/</code>)</li>
+            <li>Upload as <code>management-ca.crt</code></li>
+          </ol>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <script>
+    const fileList = document.getElementById('file-list');
+    const uploadArea = document.getElementById('upload-area');
+    const fileInput = document.getElementById('file-input');
+    const progressBar = document.getElementById('progress-bar');
+    const progressFill = document.getElementById('progress-fill');
+    const uploadStatus = document.getElementById('upload-status');
+    const browseBtn = document.getElementById('browse-btn');
+
+    const SECTIONS = [
+      {
+        key: 'frontend',
+        label: 'Frontend VM',
+        expected: ['pw_frontend.qcow2', 'pw_frontend.vmdk'],
+        tag: 'auto'
+      },
+      {
+        key: 'backend',
+        label: 'Backend VM',
+        expected: ['pw_backend.qcow2', 'pw_backend.vmdk'],
+        tag: 'auto'
+      },
+      {
+        key: 'legacy',
+        label: 'Legacy Infra / MTV',
+        match: f => f.name.endsWith('.tar.gz') || f.name.endsWith('.crt'),
+        tag: 'uploaded'
+      },
+      {
+        key: 'other',
+        label: 'Other',
+        tag: 'uploaded'
+      }
+    ];
+
+    function formatDesc(name) {
+      if (name.endsWith('.qcow2')) return 'QCOW2 — OpenShift / KubeVirt';
+      if (name.endsWith('.vmdk')) return 'VMDK — Legacy Infra';
+      if (name.endsWith('.tar.gz')) return 'Additional component archive';
+      if (/management.*\.crt/i.test(name)) return 'management server CA certificate';
+      return '';
+    }
+
+    async function loadFiles() {
+      try {
+        const resp = await fetch('/api/files');
+        const data = await resp.json();
+        const files = data.files || [];
+        const byName = {};
+        files.forEach(f => byName[f.name] = f);
+
+        const claimed = new Set();
+        const sectionData = SECTIONS.map(sec => {
+          let sectionFiles = [];
+          if (sec.expected) {
+            sectionFiles = sec.expected.map(name => {
+              claimed.add(name);
+              return byName[name] || { name, missing: true };
+            });
+          } else if (sec.match) {
+            sectionFiles = files.filter(f => !claimed.has(f.name) && sec.match(f));
+            sectionFiles.forEach(f => claimed.add(f.name));
+          } else {
+            sectionFiles = files.filter(f => !claimed.has(f.name));
+            sectionFiles.forEach(f => claimed.add(f.name));
+          }
+          return { ...sec, files: sectionFiles };
+        });
+
+        const nonEmpty = sectionData.filter(s => s.files.length > 0);
+        if (nonEmpty.length === 0) {
+          fileList.innerHTML = '<p class="empty">No artifacts yet. Run the build pipeline or upload files below.</p>';
+          return;
+        }
+
+        let html = '';
+        for (const sec of nonEmpty) {
+          const tagClass = sec.tag === 'auto' ? 'tag-auto' : 'tag-uploaded';
+          const tagLabel = sec.tag === 'auto' ? 'Pipeline' : 'Upload';
+          html += `<div class="section-label">${esc(sec.label)} <span class="tag ${tagClass}">${tagLabel}</span></div>`;
+          html += '<table class="file-table"><tbody>';
+          for (const f of sec.files) {
+            if (f.missing) {
+              html += `<tr><td class="missing" colspan="4">
+                ${esc(f.name)} — not built yet</td></tr>`;
+              continue;
+            }
+            const date = new Date(f.modified).toLocaleDateString('en-AU', {
+              day: 'numeric', month: 'short', year: 'numeric',
+              hour: '2-digit', minute: '2-digit'
+            });
+            const desc = formatDesc(f.name);
+            const canDelete = sec.key !== 'frontend' && sec.key !== 'backend';
+            html += `<tr>
+              <td class="name">
+                <a href="/files/${encodeURIComponent(f.name)}">${esc(f.name)}</a>
+                ${desc ? `<div class="format">${esc(desc)}</div>` : ''}
+              </td>
+              <td class="size">${esc(f.sizeHuman)}</td>
+              <td class="date">${esc(date)}</td>
+              <td class="actions">${canDelete ? `<button class="btn-delete" onclick="deleteFile('${escAttr(f.name)}')">delete</button>` : ''}</td>
+            </tr>`;
+          }
+          html += '</tbody></table>';
+        }
+        fileList.innerHTML = html;
+      } catch (e) {
+        fileList.innerHTML = '<p class="empty">Failed to load files</p>';
+      }
+    }
+
+    function esc(str) {
+      const d = document.createElement('div');
+      d.textContent = str;
+      return d.innerHTML;
+    }
+
+    function escAttr(str) {
+      return str.replace(/'/g, "\\'").replace(/"/g, '&quot;');
+    }
+
+    function uploadFile(file) {
+      const xhr = new XMLHttpRequest();
+      const formData = new FormData();
+      formData.append('file', file);
+
+      progressBar.style.display = 'block';
+      progressFill.style.width = '0%';
+      uploadStatus.textContent = `Uploading ${file.name}...`;
+
+      xhr.upload.onprogress = (e) => {
+        if (e.lengthComputable) {
+          const pct = Math.round((e.loaded / e.total) * 100);
+          progressFill.style.width = pct + '%';
+          uploadStatus.textContent = `Uploading ${file.name}... ${pct}%`;
+        }
+      };
+
+      xhr.onload = () => {
+        if (xhr.status === 200) {
+          uploadStatus.textContent = `Uploaded ${file.name}`;
+          progressFill.style.width = '100%';
+          setTimeout(() => {
+            progressBar.style.display = 'none';
+            uploadStatus.textContent = '';
+          }, 2000);
+          loadFiles();
+        } else {
+          let msg = 'Unknown error';
+          try { msg = JSON.parse(xhr.responseText).error; } catch {}
+          uploadStatus.textContent = `Failed: ${msg}`;
+          progressFill.style.width = '0%';
+        }
+      };
+
+      xhr.onerror = () => {
+        uploadStatus.textContent = 'Upload failed — network error';
+      };
+
+      xhr.open('POST', '/api/upload');
+      xhr.send(formData);
+    }
+
+    async function deleteFile(name) {
+      if (!confirm(`Delete ${name}?`)) return;
+      try {
+        const resp = await fetch(`/api/files/${encodeURIComponent(name)}`, { method: 'DELETE' });
+        if (resp.ok) loadFiles();
+      } catch {}
+    }
+
+    uploadArea.addEventListener('dragover', (e) => {
+      e.preventDefault();
+      uploadArea.classList.add('dragover');
+    });
+    uploadArea.addEventListener('dragleave', () => {
+      uploadArea.classList.remove('dragover');
+    });
+    uploadArea.addEventListener('drop', (e) => {
+      e.preventDefault();
+      uploadArea.classList.remove('dragover');
+      if (e.dataTransfer.files.length) uploadFile(e.dataTransfer.files[0]);
+    });
+    browseBtn.addEventListener('click', () => fileInput.click());
+    fileInput.addEventListener('change', () => {
+      if (fileInput.files.length) uploadFile(fileInput.files[0]);
+      fileInput.value = '';
+    });
+
+    loadFiles();
+  </script>
+</body>
+</html>

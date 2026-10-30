@@ -1,0 +1,93 @@
+apiVersion: tekton.dev/v1
+kind: Pipeline
+metadata:
+  name: 5-deploy-artifact-server
+  annotations:
+    description: >-
+      Builds and deploys the artifact server (Node.js with upload support)
+      behind an OAuth proxy. Copies VM disk images from the build workspace,
+      builds the server container image, deploys it, and verifies all files
+      are accessible. Users can upload additional files (Migration Components, management server CA)
+      via the web UI.
+    dependencies: "pipelines 2+3 (VM disk images must exist on build workspace)"
+spec:
+  description: >-
+    Artifact server pipeline:
+    1. Check that VM disk images exist in the build workspace
+    2. Create the dedicated artifacts PVC (if it doesn't exist)
+    3. Copy artifacts from build workspace to the dedicated PVC
+    4. Build the artifact server container image
+    5. Deploy the artifact server with OAuth proxy
+    6. Verify all files are accessible via the HTTPS route
+  params:
+    - name: namespace
+      type: string
+      description: Namespace for the artifact server deployment
+      default: "workload-portability-build"
+
+  workspaces:
+    - name: shared-workspace
+      description: "Build workspace PVC. Artifacts are in the artifacts/ subfolder."
+
+  tasks:
+    - name: check-artifacts
+      taskRef:
+        name: check-artifacts-exist
+      workspaces:
+        - name: artifacts
+          workspace: shared-workspace
+          subPath: artifacts
+
+    - name: ensure-artifacts-pvc
+      taskRef:
+        name: ensure-artifacts-pvc
+      params:
+        - name: namespace
+          value: $(params.namespace)
+
+    - name: copy-artifacts
+      runAfter:
+        - check-artifacts
+        - ensure-artifacts-pvc
+      taskRef:
+        name: copy-artifacts
+      workspaces:
+        - name: source
+          workspace: shared-workspace
+          subPath: artifacts
+
+    - name: fetch-management-ca
+      runAfter:
+        - copy-artifacts
+      taskRef:
+        name: fetch-management-ca
+      params:
+        - name: namespace
+          value: $(params.namespace)
+
+    - name: build-artifact-server
+      runAfter:
+        - fetch-management-ca
+      taskRef:
+        name: build-artifact-server
+      workspaces:
+        - name: source
+          workspace: shared-workspace
+
+    - name: deploy-artifact-server
+      runAfter:
+        - build-artifact-server
+      taskRef:
+        name: deploy-artifact-server
+      params:
+        - name: namespace
+          value: $(params.namespace)
+
+    - name: verify-artifact-server
+      runAfter:
+        - deploy-artifact-server
+      taskRef:
+        name: verify-artifact-server
+      params:
+        - name: namespace
+          value: $(params.namespace)

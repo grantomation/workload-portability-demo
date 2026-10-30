@@ -1,0 +1,139 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Portable Workload</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;600;700&family=IBM+Plex+Mono:wght@400;500;600&display=swap"
+      rel="stylesheet"
+    />
+    <link rel="stylesheet" href="/styles.css" />
+  </head>
+  <body>
+<div id="app-root" style="position:relative;display:flex;height:100vh;width:100%;overflow:hidden">
+  <aside id="sidebar" style="width:400px;flex:none;background:var(--bg-sidebar);border-right:1px solid var(--border);box-shadow:var(--sidebar-shadow);display:flex;flex-direction:column;z-index:2">
+    <div style="padding:20px 16px 14px;text-align:center">
+      <div style="font-size:20px;font-weight:600;letter-spacing:-0.3px;color:var(--text)">Infrastructure Waypoints</div>
+    </div>
+    <div style="margin:0 32px;border-top:1px solid var(--border)"></div>
+    <div id="route-list" style="flex:1;overflow-y:auto;padding:14px 12px"></div>
+    <div id="url-panel" style="display:none;overflow:hidden;max-height:0;transition:max-height 0.3s ease,opacity 0.24s ease;opacity:0">
+      <div style="margin:0 32px;border-top:1px solid var(--border)"></div>
+      <div style="padding:10px 16px 6px">
+        <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:6px">
+          <span style="font-family:'IBM Plex Mono',monospace;font-size:9px;letter-spacing:2px;color:var(--text-muted);text-transform:uppercase">Exposed Routes</span>
+          <span id="url-count" style="font-family:'IBM Plex Mono',monospace;font-size:9px;color:var(--text-sub)"></span>
+        </div>
+        <div id="url-list" style="max-height:200px;overflow-y:auto"></div>
+      </div>
+    </div>
+    <div style="margin:0 32px;border-top:1px solid var(--border)"></div>
+    <div style="padding:12px 16px;display:flex;align-items:center;justify-content:center;gap:10px">
+      <button id="theme-btn" type="button" title="Toggle light/dark theme" style="width:46px;height:46px;display:flex;align-items:center;justify-content:center;border:none;border-radius:13px;background:var(--bg-card);box-shadow:0 4px 14px rgba(0,0,0,0.18),0 0 0 1px rgba(128,128,128,0.1);cursor:pointer;transition:background 0.12s">
+        <svg id="theme-icon" width="21" height="21" viewBox="0 0 24 24" fill="none" stroke="var(--text)" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="5"/><line x1="12" y1="1" x2="12" y2="3"/><line x1="12" y1="21" x2="12" y2="23"/><line x1="4.22" y1="4.22" x2="5.64" y2="5.64"/><line x1="18.36" y1="18.36" x2="19.78" y2="19.78"/><line x1="1" y1="12" x2="3" y2="12"/><line x1="21" y1="12" x2="23" y2="12"/><line x1="4.22" y1="19.78" x2="5.64" y2="18.36"/><line x1="18.36" y1="5.64" x2="19.78" y2="4.22"/></svg>
+      </button>
+      <button id="layers-btn" type="button" title="Exposed infrastructure routes" style="width:46px;height:46px;display:flex;align-items:center;justify-content:center;border:none;border-radius:13px;background:var(--bg-card);box-shadow:0 4px 14px rgba(0,0,0,0.18),0 0 0 1px rgba(128,128,128,0.1);cursor:pointer;transition:background 0.12s, opacity 0.2s;opacity:0.3">
+        <svg id="layers-icon" width="21" height="21" viewBox="0 0 24 24" fill="none" stroke="var(--layers-stroke)" stroke-width="1.8" stroke-linejoin="round" stroke-linecap="round"><path d="M12 2 2 7l10 5 10-5-10-5Z"></path><path d="m2 17 10 5 10-5"></path><path d="m2 12 10 5 10-5"></path></svg>
+      </button>
+    </div>
+  </aside>
+
+  <div id="divider" title="Drag to resize" style="position:relative;flex:none;width:7px;margin-left:-1px;background:transparent;cursor:col-resize;z-index:6">
+    <div style="position:absolute;left:50%;top:50%;transform:translate(-50%,-50%);width:5px;height:38px;border-radius:3px;background:var(--text)"></div>
+  </div>
+
+  <main id="map" style="flex:1;position:relative;overflow:hidden;background:var(--bg-map)">
+    <canvas id="contour-canvas" style="position:absolute;inset:0;width:100%;height:100%"></canvas>
+    <canvas id="trail-canvas" style="position:absolute;inset:0;width:100%;height:100%"></canvas>
+
+    <div id="overlay" style="position:absolute;inset:0;cursor:default">
+      <div id="regions">
+        <div data-nx="0.24" data-ny="0.15" style="position:absolute;left:24%;top:15%;transform:translate(-50%,-50%);font-family:'IBM Plex Mono',monospace;font-size:13px;font-weight:500;letter-spacing:2.5px;color:var(--region-color);text-transform:uppercase;pointer-events:none;text-shadow:var(--region-shadow)">Cloud Summit</div>
+        <div data-nx="0.64" data-ny="0.12" style="position:absolute;left:64%;top:12%;transform:translate(-50%,-50%);font-family:'IBM Plex Mono',monospace;font-size:13px;font-weight:500;letter-spacing:2.5px;color:var(--region-color);text-transform:uppercase;pointer-events:none;text-shadow:var(--region-shadow)">Metal Valley</div>
+        <div data-nx="0.84" data-ny="0.31" style="position:absolute;left:84%;top:31%;transform:translate(-50%,-50%);font-family:'IBM Plex Mono',monospace;font-size:13px;font-weight:500;letter-spacing:2.5px;color:var(--region-color);text-transform:uppercase;pointer-events:none;text-shadow:var(--region-shadow)">Private Peak</div>
+        <div data-nx="0.45" data-ny="0.60" style="position:absolute;left:45%;top:60%;transform:translate(-50%,-50%);font-family:'IBM Plex Mono',monospace;font-size:13px;font-weight:500;letter-spacing:2.5px;color:var(--region-color);text-transform:uppercase;pointer-events:none;text-shadow:var(--region-shadow)">Data Ridge</div>
+        <div data-nx="0.19" data-ny="0.79" style="position:absolute;left:19%;top:79%;transform:translate(-50%,-50%);font-family:'IBM Plex Mono',monospace;font-size:13px;font-weight:500;letter-spacing:2.5px;color:var(--region-color);text-transform:uppercase;pointer-events:none;text-shadow:var(--region-shadow)">Uplink Uplands</div>
+        <div data-nx="0.76" data-ny="0.74" style="position:absolute;left:76%;top:74%;transform:translate(-50%,-50%);font-family:'IBM Plex Mono',monospace;font-size:13px;font-weight:500;letter-spacing:2.5px;color:var(--region-color);text-transform:uppercase;pointer-events:none;text-shadow:var(--region-shadow)">Edge Escarpment</div>
+      </div>
+
+      <div id="pins"></div>
+
+      <div id="ghost" style="position:absolute;display:none;transform:translate(-50%,-50%);pointer-events:none;z-index:7">
+        <div id="ghost-disc" style="width:46px;height:46px;border-radius:50%;border:3px dashed var(--ghost-border);background:var(--ghost-bg);box-shadow:0 3px 10px rgba(0,0,0,0.18)"></div>
+      </div>
+
+      <div id="namer" style="position:absolute;z-index:9;transform:translate(32px, calc(-100% - 10px));background:var(--bg-card);border:1px solid var(--border-card);border-radius:13px;padding:8px;box-shadow:0 10px 30px rgba(0,0,0,0.30);display:none;gap:8px;align-items:center">
+        <input id="namer-input" type="text" placeholder="Name this infrastructure…" maxlength="255" autocomplete="off" style="width:210px;padding:9px 12px;border:1px solid var(--border);border-radius:9px;font-size:14px;font-family:inherit;color:var(--text);outline:none;background:var(--bg-input);transition:border-color 0.15s, background 0.15s">
+        <button id="namer-btn" type="button" style="padding:9px 18px;border:none;border-radius:9px;background:var(--text);color:var(--bg);font-size:13px;font-weight:600;cursor:pointer;font-family:inherit;letter-spacing:0.2px;transition:opacity 0.15s">Pin</button>
+      </div>
+
+      <div id="vm" hidden="" style="position:absolute;transform:translate(-50%,-50%);pointer-events:none;z-index:6">
+        <div style="position:absolute;left:50%;top:50%;width:74px;height:74px;transform:translate(-50%,-50%);border-radius:50%;border:2px solid var(--vm-accent);opacity:0.32;animation:vmpulse 2.2s ease-out infinite"></div>
+        <div style="position:absolute;left:50%;top:50%;width:60px;height:60px;transform:translate(-50%,-50%);border-radius:50%;border:1.5px solid var(--vm-accent)"></div>
+        <div style="position:absolute;left:50%;bottom:44px;transform:translateX(-50%);background:var(--vm-accent);color:var(--bg);font-family:'IBM Plex Mono',monospace;font-size:11px;letter-spacing:1.5px;padding:3px 8px;border-radius:5px;white-space:nowrap">VM</div>
+      </div>
+
+      <div id="empty-state" style="position:absolute;left:50%;top:50%;transform:translate(-50%,-50%);text-align:center;pointer-events:none;color:var(--text-muted)">
+        <svg width="40" height="40" viewBox="0 0 40 40" fill="none" style="margin:0 auto 12px;display:block">
+          <circle cx="20" cy="20" r="11" stroke="var(--text-sub)" stroke-width="1.5"></circle>
+          <circle cx="20" cy="20" r="2.5" fill="var(--text-sub)"></circle>
+          <path d="M20 2v8M20 30v8M2 20h8M30 20h8" stroke="var(--text-sub)" stroke-width="1.5"></path>
+        </svg>
+        <div style="font-size:13.5px;letter-spacing:0.2px">Name your first node, then double-click anywhere<br>on the terrain to plant its pin.</div>
+      </div>
+
+
+      <div style="position:absolute;right:20px;top:18px;pointer-events:none;font-family:'IBM Plex Mono',monospace;text-align:center;font-size:14px;letter-spacing:1px;color:var(--text-muted)">
+        <div style="font-size:22px;line-height:1;color:#8b4555">▲</div>
+        N
+      </div>
+
+      <div style="position:absolute;right:20px;bottom:18px;pointer-events:none;font-family:'IBM Plex Mono',monospace;font-size:9.5px;color:var(--text-muted);letter-spacing:0.5px">
+        <div style="display:flex;height:5px;margin-bottom:4px;border:1px solid var(--text-muted)">
+          <div style="width:30px;background:var(--text-muted)"></div>
+          <div style="width:30px"></div>
+          <div style="width:30px;background:var(--text-muted)"></div>
+        </div>
+        <div style="display:flex;justify-content:space-between;width:92px"><span>0</span><span id="scale-mid">5</span><span id="scale-max">10 km</span></div>
+      </div>
+    </div>
+
+    <div id="hud-tl" style="position:absolute;left:50%;top:22px;transform:translateX(-50%);z-index:8;width:clamp(360px, 36vw, 520px);display:flex;flex-direction:column;align-items:center;gap:10px;pointer-events:none">
+      <div style="width:100%;box-sizing:border-box;pointer-events:none;background:var(--bg-card);backdrop-filter:blur(10px);-webkit-backdrop-filter:blur(10px);border:1px solid var(--border-card);border-radius:16px;padding:clamp(13px,1.3vw,18px) clamp(17px,1.5vw,22px) clamp(13px,1.3vw,18px);box-shadow:var(--card-shadow)">
+        <div style="font-family:'IBM Plex Mono',monospace;font-size:clamp(9px,0.72vw,11px);letter-spacing:2.5px;color:var(--text-muted);text-transform:uppercase;text-align:center">Route Guide · Planner</div>
+        <h1 style="margin:6px 0 0;font-size:clamp(21px,2.05vw,31px);font-weight:600;letter-spacing:-0.5px;line-height:1.04;text-align:center;color:var(--text)">Portable Workload</h1>
+        <div style="margin-top:6px;font-size:clamp(12px,0.95vw,15px);color:var(--text-sub);line-height:1.32;text-align:center">Taking your workloads for a walk across environments</div>
+      </div>
+    </div>
+
+
+    <div style="position:absolute;left:50%;bottom:20px;transform:translateX(-50%);z-index:8;background:var(--bg-card);backdrop-filter:blur(10px);-webkit-backdrop-filter:blur(10px);border:1px solid var(--border-card);border-radius:14px;padding:18px 28px;box-shadow:var(--card-shadow);min-width:280px">
+      <div style="font-family:'IBM Plex Mono',monospace;font-size:clamp(10px,0.85vw,13px);letter-spacing:2.5px;color:var(--text-muted);text-align:center">VM INFRASTRUCTURE HOST:</div>
+      <div style="margin-top:10px;font-size:18px;font-weight:700;font-family:'IBM Plex Mono',monospace;color:var(--text);letter-spacing:-0.3px;text-align:center;white-space:nowrap" id="infra-platform">Detecting...</div>
+    </div>
+
+    <div style="position:absolute;right:20px;bottom:62px;z-index:8;display:flex;flex-direction:column;background:var(--bg-card);border-radius:13px;box-shadow:0 4px 14px rgba(0,0,0,0.18), 0 0 0 1px rgba(128,128,128,0.1);overflow:hidden">
+      <button id="zoom-in" type="button" title="Zoom in" style="width:44px;height:44px;border:none;border-bottom:1px solid var(--border);background:var(--bg-card);color:var(--text);font-size:22px;line-height:1;cursor:pointer;font-family:inherit;display:flex;align-items:center;justify-content:center;transition:background 0.12s">+</button>
+      <button id="zoom-out" type="button" title="Zoom out" style="width:44px;height:44px;border:none;background:var(--bg-card);color:var(--text);font-size:26px;line-height:1;cursor:pointer;font-family:inherit;display:flex;align-items:center;justify-content:center;transition:background 0.12s">−</button>
+    </div>
+  </main>
+
+</div>
+    <div id="db-error" class="db-error" hidden>
+      <div class="db-error-card">
+        <svg width="36" height="36" viewBox="0 0 24 24" fill="none" stroke="#fff" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="margin-bottom:10px">
+          <circle cx="12" cy="12" r="10"/>
+          <line x1="12" y1="8" x2="12" y2="12"/>
+          <line x1="12" y1="16" x2="12.01" y2="16"/>
+        </svg>
+        <div class="db-error-title">Database Not Connected</div>
+        <div class="db-error-detail">The backend database is unreachable or not seeded. The app cannot function without it.</div>
+        <div class="db-error-status">Retrying connection<span class="db-error-dots"></span></div>
+      </div>
+    </div>
+    <script src="/app.js"></script>
+  </body>
+</html>

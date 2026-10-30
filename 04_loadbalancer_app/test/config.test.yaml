@@ -1,0 +1,24 @@
+title: "Test Config"
+initialActive: 1
+domain: test.example.com
+
+nodes:
+  - name: "Legacy Infra"
+    position: 1
+    icon: vm
+    url: http://localhost:9090/1
+
+  - name: "OpenShift Cluster A"
+    position: 2
+    icon: cloud
+    url: http://localhost:9090/2
+
+  - name: "OpenShift Cluster B"
+    position: 3
+    icon: cloud
+    url: http://localhost:9090/3
+
+  - name: "Bare Metal"
+    position: 4
+    icon: baremetal
+    url: http://localhost:9090/4

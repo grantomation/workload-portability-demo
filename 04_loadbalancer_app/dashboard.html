@@ -1,0 +1,835 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Application Load Balancer</title>
+  <style>
+    :root {
+      --bg0: #05070d;
+      --bg1: #0a1020;
+      --grid: rgba(80, 140, 220, .06);
+      --ink: #dce6f5;
+      --muted: #5d6b85;
+      --live: #27e08a;
+      --live-dim: #0e6b44;
+      --up: #34d3ff;
+      --down: #ffae3a;
+      --idle: #26314a;
+      --node: #0e1626;
+      --node-edge: #22324d;
+      --core-fill: #0c1422;
+      --particle: #bfffe2;
+      --hover-accent: #5dffa8;
+      --hover-plate: #3f5680;
+    }
+
+    html.light {
+      --bg0: #f0f2f5;
+      --bg1: #dfe3ea;
+      --grid: rgba(80, 120, 180, .1);
+      --ink: #1a2233;
+      --muted: #7a8599;
+      --live: #17a85e;
+      --live-dim: #a8e6c8;
+      --up: #0a8fc2;
+      --down: #d08a10;
+      --idle: #c8cdd6;
+      --node: #ffffff;
+      --node-edge: #c0c8d4;
+      --core-fill: #ffffff;
+      --particle: #17a85e;
+      --hover-accent: #0f8a4a;
+      --hover-plate: #99aabb;
+    }
+
+    * {
+      box-sizing: border-box;
+    }
+
+    html,
+    body {
+      margin: 0;
+      height: 100%;
+      background: var(--bg0);
+      color: var(--ink);
+      font-family: "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+      overflow: hidden;
+    }
+
+    #stage {
+      position: fixed;
+      inset: 0;
+      background:
+        radial-gradient(1200px 700px at 50% -10%, var(--bg1), var(--bg0) 70%),
+        linear-gradient(0deg, var(--grid) 1px, transparent 1px) 0 0/100% 46px,
+        linear-gradient(90deg, var(--grid) 1px, transparent 1px) 0 0/46px 100%;
+    }
+
+    svg {
+      width: 100%;
+      height: 100%;
+      display: block;
+    }
+
+    .label {
+      fill: var(--ink);
+      font-weight: 600;
+      text-anchor: middle;
+    }
+
+    .sub {
+      fill: var(--muted);
+      text-anchor: middle;
+      letter-spacing: .18em;
+    }
+
+    .status {
+      text-anchor: middle;
+      font-weight: 700;
+      letter-spacing: .14em;
+    }
+
+    /* connection base + flow */
+    .base {
+      stroke: var(--idle);
+      stroke-width: 2.5;
+      fill: none;
+    }
+
+    .flow {
+      fill: none;
+      stroke-width: 3.5;
+      stroke-linecap: round;
+      opacity: 0;
+      transition: opacity .5s ease, stroke .5s ease;
+      filter: url(#glow);
+    }
+
+    /* particle dots */
+    .stream circle {
+      fill: var(--particle);
+      opacity: 0;
+      transition: opacity .45s ease;
+    }
+
+    /* ── states ── */
+    .conn.active .flow {
+      opacity: 1;
+      stroke: var(--live);
+      stroke-dasharray: 18 22;
+      animation: flow 3s linear infinite;
+    }
+
+    .conn.active .stream circle {
+      opacity: 1;
+    }
+
+    .conn.up .flow {
+      opacity: 1;
+      stroke: var(--up);
+      stroke-dasharray: 1;
+      stroke-dashoffset: 1;
+      pathLength: 1;
+      animation: drawOn 1.3s ease forwards;
+    }
+
+    .conn.up .stream circle {
+      opacity: 1;
+    }
+
+    .conn.down .flow {
+      opacity: 1;
+      stroke: var(--down);
+      stroke-dasharray: 1;
+      stroke-dashoffset: 0;
+      animation: drawOff 1.3s ease forwards;
+    }
+
+    .conn.down .stream circle {
+      opacity: 0;
+    }
+
+    @keyframes flow {
+      to {
+        stroke-dashoffset: -40;
+      }
+    }
+
+    @keyframes drawOn {
+      from {
+        stroke-dashoffset: 1;
+      }
+
+      to {
+        stroke-dashoffset: 0;
+      }
+    }
+
+    @keyframes drawOff {
+      from {
+        stroke-dashoffset: 0;
+      }
+
+      to {
+        stroke-dashoffset: 1;
+      }
+    }
+
+    /* node groups */
+    .node {
+      cursor: pointer;
+    }
+
+    .node .plate {
+      fill: var(--node);
+      stroke: var(--node-edge);
+      stroke-width: 2;
+      transition: stroke .5s ease, filter .5s ease;
+    }
+
+    .node .icon {
+      stroke: var(--muted);
+      fill: none;
+      stroke-width: 2.2;
+      stroke-linecap: round;
+      stroke-linejoin: round;
+      transition: stroke .5s ease;
+    }
+
+    .node .icon .fillpart {
+      fill: var(--muted);
+      stroke: none;
+      transition: fill .5s ease;
+    }
+
+    .node.active .plate {
+      stroke: var(--live);
+      filter: url(#glow);
+    }
+
+    .node.active .icon {
+      stroke: var(--live);
+    }
+
+    .node.active .icon .fillpart {
+      fill: var(--live);
+    }
+
+    .node.up .plate {
+      stroke: var(--up);
+      filter: url(#glow);
+    }
+
+    .node.up .icon {
+      stroke: var(--up);
+    }
+
+    .node.up .icon .fillpart {
+      fill: var(--up);
+    }
+
+    .node.down .plate {
+      stroke: var(--down);
+    }
+
+    .node.down .icon {
+      stroke: var(--down);
+    }
+
+    .node.down .icon .fillpart {
+      fill: var(--down);
+    }
+
+    .node:hover .plate {
+      stroke: var(--hover-plate);
+    }
+
+    .node.active.offline .plate {
+      stroke: #ff3333 !important;
+      animation: pulse-red 2.5s infinite;
+      filter: none !important;
+    }
+
+    /* If it is active but offline, don't show green glow on the icon */
+    .node.active.offline .icon { stroke: #ff3333 !important; }
+    .node.active.offline .icon .fillpart { fill: #ff3333 !important; }
+
+    /* Stop the particles and turn the flow line grey when offline */
+    .conn.active.offline .stream circle {
+      opacity: 0 !important;
+    }
+    .conn.active.offline .flow {
+      stroke: var(--muted) !important;
+    }
+
+    @keyframes pulse-red {
+      0%   { stroke-opacity: 0.2; }
+      50%  { stroke-opacity: 1; }
+      100% { stroke-opacity: 0.2; }
+    }
+
+    .st-active {
+      fill: var(--live);
+    }
+
+    .st-offline {
+      fill: #ff3333;
+    }
+
+    .st-up {
+      fill: var(--up);
+    }
+
+    .st-down {
+      fill: var(--down);
+    }
+
+    .st-idle {
+      fill: var(--muted);
+    }
+
+    /* LB core */
+    #lb .core {
+      fill: var(--core-fill);
+      stroke: var(--live);
+      stroke-width: 2.5;
+      filter: url(#glow);
+    }
+
+    #lb text.title {
+      fill: var(--ink);
+      font-weight: 700;
+      letter-spacing: .22em;
+      text-anchor: middle;
+    }
+
+    #lb text.tgt {
+      fill: var(--ink);
+      font-weight: 600;
+      text-anchor: middle;
+      letter-spacing: .04em;
+    }
+
+    #lb text.tgtlbl {
+      fill: var(--muted);
+      text-anchor: middle;
+      letter-spacing: .2em;
+    }
+
+    /* clickable LB + target link */
+    #lb-link {
+      cursor: pointer;
+    }
+
+    #lb-link:hover .core {
+      stroke: var(--hover-accent);
+      filter: url(#glow);
+      stroke-width: 3;
+    }
+
+    #lb-link:hover text.title {
+      fill: var(--ink);
+    }
+
+    #tgt-link {
+      cursor: pointer;
+    }
+
+    #tgt-link text.tgt {
+      text-decoration: underline;
+    }
+
+    #tgt-link:hover text.tgt {
+      fill: var(--hover-accent);
+    }
+
+    #lb-link.disabled {
+      cursor: default;
+      pointer-events: none;
+    }
+
+    #tgt-link.disabled {
+      cursor: default;
+      pointer-events: none;
+    }
+
+    #tgt-link.disabled text.tgt {
+      text-decoration: none;
+    }
+
+    .pulse {
+      transform-box: fill-box;
+      transform-origin: center;
+      animation: pulse 2.4s ease-in-out infinite;
+    }
+
+    @keyframes pulse {
+
+      0%,
+      100% {
+        opacity: .55
+      }
+
+      50% {
+        opacity: 1
+      }
+    }
+
+    #hint {
+      position: fixed;
+      left: 18px;
+      bottom: 14px;
+      color: var(--muted);
+      font-size: 12px;
+      letter-spacing: .12em;
+      opacity: .5;
+    }
+
+    #conn-dot {
+      position: fixed;
+      right: 18px;
+      bottom: 14px;
+      width: 9px;
+      height: 9px;
+      border-radius: 50%;
+      background: var(--down);
+      box-shadow: 0 0 8px var(--down);
+      transition: background .3s, box-shadow .3s;
+    }
+
+    #conn-dot.live {
+      background: var(--live);
+      box-shadow: 0 0 8px var(--live);
+    }
+
+    #theme-toggle {
+      position: fixed;
+      top: 16px;
+      right: 16px;
+      width: 36px;
+      height: 36px;
+      border: 1px solid var(--muted);
+      border-radius: 8px;
+      background: transparent;
+      color: var(--ink);
+      cursor: pointer;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-size: 18px;
+      z-index: 10;
+      opacity: .7;
+      transition: opacity .3s, border-color .3s;
+    }
+
+    #theme-toggle:hover {
+      opacity: 1;
+      border-color: var(--ink);
+    }
+  </style>
+</head>
+
+<body>
+  <div id="stage">
+    <svg id="svg" viewBox="0 0 1600 900" preserveAspectRatio="xMidYMid meet">
+      <defs>
+        <filter id="glow" x="-60%" y="-60%" width="220%" height="220%">
+          <feGaussianBlur stdDeviation="4.5" result="b" />
+          <feMerge>
+            <feMergeNode in="b" />
+            <feMergeNode in="SourceGraphic" />
+          </feMerge>
+        </filter>
+      </defs>
+      <g id="links"></g>
+      <g id="nodes"></g>
+      <g id="lb"></g>
+    </svg>
+  </div>
+  <div id="hint">CLICK OR PRESS 1–9 TO SWITCH · → NEXT · DOUBLE-CLICK OPENS THE SITE</div>
+  <div id="conn-dot" title="event stream"></div>
+  <button id="theme-toggle" title="Toggle light/dark theme"></button>
+
+  <script>
+    (function initTheme() {
+      const saved = localStorage.getItem("theme");
+      if (saved === "light") document.documentElement.classList.add("light");
+      const btn = document.getElementById("theme-toggle");
+      function updateIcon() {
+        btn.textContent = document.documentElement.classList.contains("light") ? "\u263E" : "\u2600";
+      }
+      updateIcon();
+      btn.addEventListener("click", () => {
+        document.documentElement.classList.toggle("light");
+        localStorage.setItem("theme", document.documentElement.classList.contains("light") ? "light" : "dark");
+        updateIcon();
+      });
+    })();
+
+    const SVGNS = "http://www.w3.org/2000/svg";
+    const W = 1600, H = 900;
+    const LB = { x: 800, y: 190 };       // load-balancer core (bumped down for bigger orb)
+    const ROW_Y = 700;                    // bottom row of infrastructure
+    const TRANSITION_MS = 1300;
+
+    // ════════════════════════════════════════════════════════════════
+    //  EDIT YOUR NODES HERE  (used when you just double-click this file)
+    //  - position : left → right order (1,2,3,4,5…)
+    //  - icon     : vm | cloud | baremetal
+    //  - url      : http:// or https:// backend target
+    //  Add a line = add a node. The pyramid re-lays-out automatically.
+    //  (If this file is served by server.js it uses config.yaml instead.)
+    // ════════════════════════════════════════════════════════════════
+    const EMBEDDED = {
+      title: "Application LB",
+      initialActive: 1,
+      nodes: [
+        { name: "Legacy Infra", position: 1, icon: "vm", url: "http://app.legacy-infra.example.com" },
+        { name: "OpenShift Cluster A", position: 2, icon: "cloud", url: "https://frontend-clustera.apps.ocp-a.example.com" },
+        { name: "OpenShift Cluster B", position: 3, icon: "cloud", url: "https://frontend-clusterb.apps.ocp-b.example.com" },
+        { name: "Bare Metal (on-prem)", position: 4, icon: "baremetal", url: "https://frontend-baremetal.apps.ocp-bm.example.com" },
+      ],
+    };
+
+    let model = { title: "Application LB", domain: "", nodes: [], active: null, health: {} };
+    let prevActive = null;
+    let standalone = true;   // flipped to false if a live server is detected
+
+    // ── icon library (drawn inside a 56x56 box centred at 0,0) ──
+    function icon(kind) {
+      const g = el("g", { class: "icon", transform: "translate(-28,-30)" });
+      const add = (t, a) => g.appendChild(el(t, a));
+      if (kind === "vm") {
+        add("rect", { x: 6, y: 6, width: 44, height: 32, rx: 3 });
+        add("line", { x1: 6, y1: 30, x2: 50, y2: 30 });
+        add("circle", { class: "fillpart", cx: 13, cy: 13, r: 2 });
+        add("rect", { x: 22, y: 42, width: 12, height: 7, rx: 1 });
+        add("line", { x1: 14, y1: 52, x2: 42, y2: 52 });
+        add("path", { class: "fillpart", d: "M24 16 l9 5 l-9 5 z" }); // play = "VM running"
+      } else if (kind === "baremetal") {
+        for (const y of [8, 24, 40]) {
+          add("rect", { x: 8, y, width: 40, height: 12, rx: 2 });
+          add("circle", { class: "fillpart", cx: 14, cy: y + 6, r: 2 });
+          add("line", { x1: 24, y1: y + 6, x2: 42, y2: y + 6 });
+        }
+      } else { // cloud (OpenShift managed)
+        add("path", { d: "M16 40 a12 12 0 0 1 1 -23 a15 15 0 0 1 28 4 a10 10 0 0 1 -2 19 z" });
+        add("circle", { class: "fillpart", cx: 28, cy: 30, r: 3 });
+        add("path", { d: "M28 30 l9 -6 M28 30 l-9 -6 M28 30 l0 11", fill: "none" });
+      }
+      return g;
+    }
+
+    function el(tag, attrs) {
+      const e = document.createElementNS(SVGNS, tag);
+      for (const k in attrs) e.setAttribute(k, attrs[k]);
+      return e;
+    }
+
+    // cubic path from LB down to a node — gives the nice fanned arc
+    function linkPath(nx, ny) {
+      const sy = LB.y + 104;           // leave the LB core (matches larger radius)
+      const ey = ny - 56;             // arrive at the node plate top
+      const midy = (sy + ey) / 2 + 40;
+      return `M ${LB.x} ${sy} C ${LB.x} ${midy}, ${nx} ${ey - 80}, ${nx} ${ey}`;
+    }
+
+    function layout(n, i) {
+      const margin = 80;
+      const usable = W - margin * 2;
+      const x = n === 1 ? W / 2 : margin + (usable * (i + 0.5)) / n;
+      const stagger = (n >= 4 && i % 2 !== 0) ? 60 : 0;
+      return { x, y: ROW_Y + stagger };
+    }
+
+    function clearSVG(el) { while (el.firstChild) el.removeChild(el.firstChild); }
+
+    function build() {
+      const links = document.getElementById("links");
+      const nodes = document.getElementById("nodes");
+      const lb = document.getElementById("lb");
+      clearSVG(links); clearSVG(nodes); clearSVG(lb);
+
+      const N = model.nodes.length;
+
+      model.nodes.forEach((node, i) => {
+        const pos = layout(N, i);
+        node._x = pos.x; node._y = pos.y;
+        const d = linkPath(pos.x, pos.y);
+
+        // ── connection ──
+        const conn = el("g", { class: "conn", "data-pos": node.position });
+        conn.appendChild(el("path", { class: "base", d }));
+        const flow = el("path", { class: "flow", d, pathLength: "1" });
+        conn.appendChild(flow);
+        const stream = el("g", { class: "stream" });
+        const pathId = "p" + node.position;
+        flow.setAttribute("id", pathId);
+        // sporadic particles — varied sizes, speeds, and stagger for organic feel
+        const particles = [
+          { r: 4.5, dur: "2.4s", begin: "0s", opacity: .95 },
+          { r: 2.8, dur: "3.1s", begin: "0.3s", opacity: .6 },
+          { r: 5.0, dur: "2.0s", begin: "0.7s", opacity: 1 },
+          { r: 2.2, dur: "3.6s", begin: "1.1s", opacity: .45 },
+          { r: 3.8, dur: "2.7s", begin: "1.5s", opacity: .8 },
+          { r: 2.0, dur: "4.0s", begin: "1.9s", opacity: .35 },
+          { r: 4.2, dur: "2.2s", begin: "2.3s", opacity: .9 },
+          { r: 3.0, dur: "3.4s", begin: "2.8s", opacity: .55 },
+        ];
+        for (const p of particles) {
+          const c = el("circle", { r: p.r, fill: "#bfffe2", opacity: p.opacity });
+          const m = el("animateMotion", {
+            dur: p.dur, repeatCount: "indefinite",
+            begin: p.begin, rotate: "0"
+          });
+          m.appendChild(el("mpath", { href: "#" + pathId }));
+          c.appendChild(m);
+          stream.appendChild(c);
+        }
+        conn.appendChild(stream);
+        links.appendChild(conn);
+
+        // ── node ──
+        const g = el("g", {
+          class: "node", "data-pos": node.position,
+          transform: `translate(${pos.x},${pos.y})`
+        });
+        // support multiline text separated by \n
+        const lines = node.name.split(/\\n|\n/);
+        const extraLines = Math.max(0, lines.length - 1);
+        const plateH = 116 + (extraLines * 18);
+        
+        // plate starts at a default size; resized after text measurement
+        g.appendChild(el("rect", { class: "plate", x: -70, y: -58, width: 140, height: plateH, rx: 14 }));
+        const ic = icon(node.icon);
+        ic.setAttribute("transform", "translate(-28,-58)");
+        g.appendChild(ic);
+        
+        const name = el("text", { class: "label", x: 0, y: 24, "font-size": 16 });
+        lines.forEach((line, li) => {
+          const tspan = el("tspan", { x: 0, dy: li === 0 ? "0" : "1.2em" });
+          tspan.textContent = line;
+          name.appendChild(tspan);
+        });
+        g.appendChild(name);
+        
+        const stat = el("text", { class: "status", x: 0, y: 50 + (extraLines * 18), "font-size": 11 });
+        stat.textContent = "STANDBY";
+        g.appendChild(stat);
+        g.addEventListener("click", () => activate(node.position));
+        g.addEventListener("dblclick", () => { if (node.url) window.open(node.url, "_blank", "noopener"); });
+        nodes.appendChild(g);
+      });
+
+      // ── LB core (clickable — opens dashboard in new tab) ──
+      const lbLink = el("g", { id: "lb-link" });
+      lbLink.appendChild(el("circle", { class: "core", id: "core", cx: LB.x, cy: LB.y, r: 84 }));
+      const t = el("text", { class: "title", x: LB.x, y: LB.y - 4, "font-size": 16 });
+      t.textContent = "APPLICATION"; lbLink.appendChild(t);
+      const t2 = el("text", { class: "title", x: LB.x, y: LB.y + 18, "font-size": 18 });
+      t2.textContent = "LB"; lbLink.appendChild(t2);
+      lbLink.addEventListener("click", () => openActive());
+      lb.appendChild(lbLink);
+
+      // ── domain label (clickable — opens active node's URL) ──
+      const tl = el("text", { class: "tgtlbl", x: LB.x, y: LB.y - 136, "font-size": 11 });
+      tl.textContent = "DOMAIN"; lb.appendChild(tl);
+      const tgtLink = el("g", { id: "tgt-link" });
+      const tg = el("text", { class: "tgt", id: "tgt", x: LB.x, y: LB.y - 114, "font-size": 16 });
+      tgtLink.appendChild(tg);
+      tgtLink.addEventListener("click", () => openActive());
+      lb.appendChild(tgtLink);
+
+      render();
+
+      // ── auto-size node plates to fit their text labels ──
+      requestAnimationFrame(() => {
+        document.querySelectorAll(".node").forEach((g) => {
+          const label = g.querySelector(".label");
+          const plate = g.querySelector(".plate");
+          if (!label || !plate) return;
+          const bbox = label.getBBox();
+          const pad = 12;  // reduced horizontal padding each side
+          const halfW = Math.max(70, (bbox.width / 2) + pad);
+          plate.setAttribute("x", -halfW);
+          plate.setAttribute("width", halfW * 2);
+        });
+      });
+    }
+
+    function render() {
+      document.querySelectorAll(".node").forEach((g) => {
+        const pos = +g.dataset.pos;
+        const conn = document.querySelector(`.conn[data-pos="${pos}"]`);
+        const stat = g.querySelector(".status");
+        g.classList.remove("active", "up", "down", "offline");
+        conn.classList.remove("active", "up", "down", "offline");
+        stat.classList.remove("st-active", "st-up", "st-down", "st-idle", "st-offline");
+
+        if (model.health && model.health[pos] === 'offline') {
+          g.classList.add("offline");
+          conn.classList.add("offline");
+        }
+
+        const isOffline = model.health && model.health[pos] === 'offline';
+        if (pos === model.active && pos === prevActive) {
+          g.classList.add("active"); conn.classList.add("active");
+          stat.textContent = isOffline ? "INACTIVE" : "ACTIVE"; 
+          stat.classList.add(isOffline ? "st-offline" : "st-active");
+        } else if (pos === model.active) {
+          g.classList.add("up"); conn.classList.add("up");
+          stat.textContent = "ENGAGING"; stat.classList.add("st-up");
+        } else if (pos === prevActive) {
+          g.classList.add("down"); conn.classList.add("down");
+          stat.textContent = "DRAINING"; stat.classList.add("st-down");
+        } else {
+          stat.textContent = "STANDBY"; stat.classList.add("st-idle");
+        }
+      });
+
+      const tg = document.getElementById("tgt");
+      const activeOffline = model.health && model.health[model.active] === 'offline';
+      if (tg) {
+        tg.textContent = model.domain || "—";
+        tg.style.fill = activeOffline ? "var(--ink)" : "var(--live)";
+      }
+
+      const lbLink = document.getElementById("lb-link");
+      const tgtLink = document.getElementById("tgt-link");
+      if (lbLink) lbLink.classList.toggle("disabled", !!activeOffline);
+      if (tgtLink) tgtLink.classList.toggle("disabled", !!activeOffline);
+
+      const core = document.getElementById("core");
+      if (core) {
+        const isOffline = model.health && model.health[model.active] === 'offline';
+        core.style.stroke = isOffline ? "var(--muted)" : "var(--live)";
+      }
+    }
+
+    function hostOf(url) {
+      try { return new URL(url).host; } catch { return url; }
+    }
+
+    // restart the SMIL particle animations so a fresh stream visibly kicks off
+    function kick(conn) {
+      conn.querySelectorAll("animateMotion").forEach((m) => {
+        try { m.beginElement(); } catch { }
+      });
+    }
+
+    function applyActive(next) {
+      if (next === model.active) { render(); return; }
+      prevActive = model.active;
+      model.active = next;
+      render();
+      const upConn = document.querySelector(`.conn[data-pos="${next}"]`);
+      if (upConn) kick(upConn);
+      // settle: drained node -> standby, engaged node -> steady active
+      setTimeout(() => { prevActive = model.active; render(); }, TRANSITION_MS);
+    }
+
+    function setModel(s) {
+      model.title = s.title;
+      model.domain = s.domain || '';
+      model.nodes = s.nodes || [];
+      model.health = s.health || {};
+      const wasActive = model.active;
+      model.active = s.active;
+      prevActive = (wasActive == null) ? s.active : wasActive;
+      build();
+      if (wasActive != null && wasActive !== s.active) {
+        // a config push that also changed active — animate it
+        model.active = wasActive; applyActive(s.active);
+      }
+    }
+
+    // ── actions ──
+    function activate(pos) {
+      if (!model.nodes.some((n) => n.position === pos)) return;
+      if (standalone) { applyActive(pos); return; }
+      fetch("/api/activate?position=" + pos).catch(() => { });
+      applyActive(pos); // optimistic; the SSE echo confirms
+    }
+    function step(dir) {
+      if (!model.nodes.length) return;
+      const order = model.nodes.map((n) => n.position);
+      let i = order.indexOf(model.active);
+      i = (i + dir + order.length) % order.length;
+      activate(order[i]);
+    }
+    function openActive() {
+      const activeOffline = model.health && model.health[model.active] === 'offline';
+      if (model.domain && !activeOffline) window.open("http://" + model.domain, "_blank", "noopener");
+    }
+
+    // keyboard: 1-9 jump, ←/→ or space step, Enter/o opens the live target
+    window.addEventListener("keydown", (e) => {
+      if (e.key >= "1" && e.key <= "9") return activate(parseInt(e.key, 10));
+      if (e.key === "ArrowRight" || e.key === " ") { e.preventDefault(); return step(1); }
+      if (e.key === "ArrowLeft") return step(-1);
+      if (e.key === "Enter" || e.key === "o") return openActive();
+    });
+
+    // no-infra remote trigger: point the kiosk tab at  …dashboard.html#3
+    // (or #active=3) and it switches. Anything that can change the URL works.
+    function fromHash() {
+      const m = (location.hash || "").match(/(\d+)/);
+      if (m) activate(parseInt(m[1], 10));
+    }
+    window.addEventListener("hashchange", fromHash);
+
+    // optional ambient loop:  …dashboard.html?auto=6  cycles every 6s
+    let attractTimer = null;
+    function attract() {
+      const s = parseFloat(new URLSearchParams(location.search).get("auto"));
+      if (s > 0) attractTimer = setInterval(() => step(1), s * 1000);
+    }
+
+    // ── live wiring (only when served by server.js) ──
+    function normalize(nodes) {
+      return (nodes || [])
+        .map((n) => ({
+          name: String(n.name), position: parseInt(n.position, 10) || 0,
+          icon: (n.icon || "cloud").toLowerCase(), url: String(n.url || "")
+        }))
+        .sort((a, b) => a.position - b.position);
+    }
+    function connect() {
+      const dot = document.getElementById("conn-dot");
+      const es = new EventSource("/api/events");
+      es.addEventListener("config", (e) => { dot.classList.add("live"); setModel(JSON.parse(e.data)); });
+      es.addEventListener("health", (e) => {
+        const data = JSON.parse(e.data);
+        if (!model.health) model.health = {};
+        model.health[data.position] = data.status;
+        render();
+      });
+      es.addEventListener("activate", (e) => { applyActive(JSON.parse(e.data).active); });
+      es.onopen = () => dot.classList.add("live");
+      es.onerror = () => dot.classList.remove("live");
+    }
+
+    // ── boot: use the live server if present, else the embedded config ──
+    async function boot() {
+      if (location.protocol.startsWith("http")) {
+        try {
+          const r = await fetch("/api/state", { cache: "no-store" });
+          if (r.ok) { standalone = false; setModel(await r.json()); connect(); return; }
+        } catch { /* fall through to standalone */ }
+      }
+      standalone = true;
+      const dot = document.getElementById("conn-dot");
+      dot.classList.add("live");
+      dot.title = "standalone (no server needed)";
+      setModel({
+        title: EMBEDDED.title, nodes: normalize(EMBEDDED.nodes),
+        active: EMBEDDED.initialActive
+      });
+    }
+    boot().then(() => { fromHash(); attract(); });
+  </script>
+</body>
+
+</html>

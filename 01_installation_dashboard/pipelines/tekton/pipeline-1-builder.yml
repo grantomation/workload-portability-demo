@@ -1,0 +1,66 @@
+apiVersion: tekton.dev/v1
+kind: Pipeline
+metadata:
+  name: 1-build-vm-builder-image
+  annotations:
+    description: >-
+      Builds the golden-builder container image (Fedora 44 + guestfs-tools + qemu-img).
+      This image is used by pipelines 2+3 to create golden VM disk images.
+      Run this first. Only re-run if 07_build/builder/Containerfile changes.
+    dependencies: "none"
+spec:
+  description: >-
+    Clone the repo and build the golden-builder container image from
+    07_build/builder/Containerfile. Pushes to the internal OpenShift registry.
+    Produces: <registry>/golden-builder:latest
+  params:
+    - name: git-url
+      type: string
+      description: Git repository URL
+      default: "__SOURCE_REPO_URL__"
+    - name: git-revision
+      type: string
+      description: Branch or commit to build from
+      default: "__SOURCE_REPO_REVISION__"
+    - name: image-registry
+      type: string
+      description: Internal registry path (no trailing slash)
+      default: "image-registry.openshift-image-registry.svc:5000/workload-portability-build"
+
+  workspaces:
+    - name: shared-workspace
+      description: Workspace for cloned source code (PVC)
+
+  tasks:
+    - name: clone
+      taskRef:
+        resolver: cluster
+        params:
+          - name: kind
+            value: task
+          - name: name
+            value: git-clone
+          - name: namespace
+            value: openshift-pipelines
+      workspaces:
+        - name: output
+          workspace: shared-workspace
+      params:
+        - name: URL
+          value: $(params.git-url)
+        - name: REVISION
+          value: $(params.git-revision)
+        - name: DELETE_EXISTING
+          value: "false"
+
+    - name: build-builder-image
+      runAfter:
+        - clone
+      taskRef:
+        name: build-builder-image
+      workspaces:
+        - name: source
+          workspace: shared-workspace
+      params:
+        - name: image-registry
+          value: $(params.image-registry)

@@ -1,0 +1,30 @@
+apiVersion: image.openshift.io/v1
+kind: ImageStream
+metadata:
+  name: installation-dashboard
+  namespace: workload-portability-build
+---
+apiVersion: build.openshift.io/v1
+kind: BuildConfig
+metadata:
+  name: installation-dashboard
+  namespace: workload-portability-build
+spec:
+  source:
+    type: Git
+    git:
+      uri: __SOURCE_REPO_URL__
+      ref: "__SOURCE_REPO_REVISION__"
+  strategy:
+    type: Source
+    sourceStrategy:
+      from:
+        kind: ImageStreamTag
+        namespace: openshift
+        name: nodejs:22-ubi9-minimal
+  output:
+    to:
+      kind: ImageStreamTag
+      name: installation-dashboard:latest
+  triggers:
+    - type: ConfigChange

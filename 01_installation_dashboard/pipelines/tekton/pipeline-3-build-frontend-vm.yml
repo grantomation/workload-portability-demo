@@ -1,0 +1,92 @@
+apiVersion: tekton.dev/v1
+kind: Pipeline
+metadata:
+  name: 3-build-frontend-vm
+  annotations:
+    description: >-
+      Builds the frontend Alpine VM — Node.js app with Avahi for zero-config
+      service discovery. Produces pw_frontend.qcow2 and .vmdk in
+      the artifacts/ folder on the shared workspace PVC.
+      Requires pipeline 1 to have run first (golden-builder image must exist).
+    dependencies: "pipeline 1 (golden-builder image)"
+spec:
+  description: >-
+    Frontend VM build pipeline:
+    1. Clone repo
+    2. Check that the golden-builder image exists (fails fast if pipeline 1 hasn't run)
+    3. Build frontend VM (Node.js + app + Avahi)
+    Outputs: pw_frontend.qcow2/.vmdk in artifacts/
+  params:
+    - name: git-url
+      type: string
+      description: Git repository URL
+      default: "__SOURCE_REPO_URL__"
+    - name: git-revision
+      type: string
+      description: Branch or commit to build from
+      default: "__SOURCE_REPO_REVISION__"
+    - name: alpine-rel
+      type: string
+      description: Alpine Linux release version for the VM
+      default: "3.21.2"
+    - name: namespace
+      type: string
+      description: Namespace to check for the golden-builder image
+      default: "workload-portability-build"
+
+  workspaces:
+    - name: shared-workspace
+      description: "Single PVC for source code and artifacts. VM disk images written to artifacts/ subfolder."
+
+  tasks:
+    - name: clone
+      taskRef:
+        resolver: cluster
+        params:
+          - name: kind
+            value: task
+          - name: name
+            value: git-clone
+          - name: namespace
+            value: openshift-pipelines
+      workspaces:
+        - name: output
+          workspace: shared-workspace
+      params:
+        - name: URL
+          value: $(params.git-url)
+        - name: REVISION
+          value: $(params.git-revision)
+        - name: DELETE_EXISTING
+          value: "false"
+
+    - name: check-builder-image
+      runAfter:
+        - clone
+      taskRef:
+        name: check-image-exists
+      params:
+        - name: image
+          value: "golden-builder:latest"
+        - name: namespace
+          value: $(params.namespace)
+        - name: produced-by
+          value: "pipeline 1 (1-build-vm-builder-image)"
+
+    - name: build-frontend-vm
+      retries: 1
+      runAfter:
+        - check-builder-image
+      taskRef:
+        name: build-vm
+      workspaces:
+        - name: source
+          workspace: shared-workspace
+        - name: artifacts
+          workspace: shared-workspace
+          subPath: artifacts
+      params:
+        - name: role
+          value: frontend
+        - name: alpine-rel
+          value: $(params.alpine-rel)

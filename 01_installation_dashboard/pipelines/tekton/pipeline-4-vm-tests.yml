@@ -1,0 +1,185 @@
+apiVersion: tekton.dev/v1
+kind: Pipeline
+metadata:
+  name: 4-vm-tests
+  annotations:
+    description: >-
+      Packages VM disk images as containerDisk images, deploys them on
+      OpenShift Virt, and runs both OpenShift integration tests and
+      Legacy Infra-readiness tests. Cleans up all test VMs on success.
+      Requires pipelines 2 and 3 to have run first (VM disk images must exist).
+    dependencies: "pipeline 2 (backend VM image), pipeline 3 (frontend VM image)"
+spec:
+  description: >-
+    VM test pipeline (OpenShift + Legacy Infra):
+    1. Clean up any leftover test VMs from a previous run
+    2. Validate VM disk artifacts exist and have correct format
+    3. Package backend and frontend qcow2 as containerDisk images
+    4. Deploy VMs + Services + Route on the build cluster
+    5. Test OpenShift Service DNS resolution and app health
+    6. Test app API end-to-end (POST stops, GET verify)
+    7. Test Legacy Infra readiness (Avahi, hostname, services, DB seed)
+    8. If the artifact server is already deployed, refresh it with the new images
+    9. Clean up all test VMs (runs in finally, on success only)
+  params:
+    - name: namespace
+      type: string
+      description: Namespace for smoke test deployment
+      default: "workload-portability-build"
+    - name: image-registry
+      type: string
+      description: Internal registry path (no trailing slash)
+      default: "image-registry.openshift-image-registry.svc:5000/workload-portability-build"
+
+  workspaces:
+    - name: shared-workspace
+      description: "Same PVC as all other pipelines. VM images are in the artifacts/ subfolder."
+
+  tasks:
+    - name: cleanup-old-test-vms
+      taskRef:
+        name: cleanup-test-vms
+      params:
+        - name: namespace
+          value: $(params.namespace)
+
+    - name: check-vm-images
+      runAfter:
+        - cleanup-old-test-vms
+      taskRef:
+        name: check-artifacts-exist
+      workspaces:
+        - name: artifacts
+          workspace: shared-workspace
+          subPath: artifacts
+
+    - name: validate-vm-artifacts
+      runAfter:
+        - cleanup-old-test-vms
+      taskRef:
+        name: validate-vm-artifacts
+      workspaces:
+        - name: artifacts
+          workspace: shared-workspace
+          subPath: artifacts
+      params:
+        - name: image-registry
+          value: $(params.image-registry)
+
+    - name: package-backend
+      runAfter:
+        - check-vm-images
+        - validate-vm-artifacts
+      taskRef:
+        name: package-vm-containerdisk
+      workspaces:
+        - name: artifacts
+          workspace: shared-workspace
+          subPath: artifacts
+      params:
+        - name: role
+          value: backend
+        - name: image-registry
+          value: $(params.image-registry)
+
+    - name: package-frontend
+      runAfter:
+        - package-backend
+      taskRef:
+        name: package-vm-containerdisk
+      workspaces:
+        - name: artifacts
+          workspace: shared-workspace
+          subPath: artifacts
+      params:
+        - name: role
+          value: frontend
+        - name: image-registry
+          value: $(params.image-registry)
+
+    - name: deploy-test-vms
+      runAfter:
+        - package-frontend
+      taskRef:
+        name: deploy-test-vms
+      params:
+        - name: namespace
+          value: $(params.namespace)
+        - name: image-registry
+          value: $(params.image-registry)
+
+    - name: test-ocp-service-dns
+      runAfter:
+        - deploy-test-vms
+      taskRef:
+        name: test-ocp-service-dns
+      params:
+        - name: route-host
+          value: $(tasks.deploy-test-vms.results.route-host)
+        - name: namespace
+          value: $(params.namespace)
+
+    - name: test-ocp-app-api
+      runAfter:
+        - test-ocp-service-dns
+      taskRef:
+        name: test-ocp-app-api
+      params:
+        - name: route-host
+          value: $(tasks.deploy-test-vms.results.route-host)
+
+    - name: test-legacy-backend
+      runAfter:
+        - test-ocp-app-api
+      taskRef:
+        name: test-legacy-backend
+      params:
+        - name: namespace
+          value: $(params.namespace)
+
+    - name: test-legacy-frontend
+      runAfter:
+        - test-legacy-backend
+      taskRef:
+        name: test-legacy-frontend
+      params:
+        - name: namespace
+          value: $(params.namespace)
+
+    - name: check-artifact-server
+      runAfter:
+        - test-legacy-frontend
+      taskRef:
+        name: check-artifact-server
+      params:
+        - name: namespace
+          value: $(params.namespace)
+
+    - name: refresh-artifact-server
+      runAfter:
+        - check-artifact-server
+      when:
+        - input: $(tasks.check-artifact-server.results.exists)
+          operator: in
+          values: ["yes"]
+      taskRef:
+        name: refresh-artifact-server
+      params:
+        - name: namespace
+          value: $(params.namespace)
+      workspaces:
+        - name: source
+          workspace: shared-workspace
+          subPath: artifacts
+
+  finally:
+    - name: cleanup
+      when:
+        - input: $(tasks.status)
+          operator: in
+          values: ["Succeeded", "Completed"]
+      taskRef:
+        name: cleanup-test-vms
+      params:
+        - name: namespace
+          value: $(params.namespace)

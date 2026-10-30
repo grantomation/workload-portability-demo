@@ -1,0 +1,51 @@
+# SOURCE: https://install.portworx.com/3.6?operator=true&mc=false&kbver=1.34.0&ns=portworx&b=true&kvdbtls=true&certmgr=true&iop=6&s=%22type%3Dpd-standard%2Csize%3D150%22&ce=gce&dmthin=true&r=17001&c=px-cluster-49f5467b-4868-4b67-a590-581a3391cd59&gke=true&osft=true&stork=true&csi=true&aut=false&tel=true&st=k8s
+kind: StorageCluster
+apiVersion: core.libopenstorage.org/v1
+metadata:
+  name: px-cluster-49f5467b-4868-4b67-a590-581a3391cd59
+  namespace: portworx
+  annotations:
+    portworx.io/install-source: "https://install.portworx.com/3.6?operator=true&mc=false&kbver=1.34.0&ns=portworx&b=true&kvdbtls=true&certmgr=true&iop=6&s=%22type%3Dpd-standard%2Csize%3D150%22&ce=gce&dmthin=true&r=17001&c=px-cluster-49f5467b-4868-4b67-a590-581a3391cd59&gke=true&osft=true&stork=true&csi=true&aut=false&tel=true&st=k8s"
+    portworx.io/is-openshift: "true"
+    portworx.io/is-gke: "true"
+    portworx.io/misc-args: " -T px-storev2 "
+    portworx.io/preflight-check: "true"
+    portworx.io/service-type: "portworx-api:LoadBalancer"
+spec:
+  image: docker.io/portworx/oci-monitor:3.6.2
+  imagePullPolicy: Always
+  kvdb:
+    internal: true
+    enableTLS: true
+  cloudStorage:
+    deviceSpecs:
+    - type=pd-ssd,size=150
+    kvdbDeviceSpec: type=pd-ssd,size=64
+  secretsProvider: k8s
+  startPort: 17001
+  autopilot:
+    enabled: true
+  stork:
+    enabled: true
+    args:
+      webhook-controller: "true"
+      admin-namespace: "portworx"
+  runtimeOptions:
+    default-io-profile: "6"
+  csi:
+    enabled: true
+  monitoring:
+    telemetry:
+      enabled: true
+    prometheus:
+      exportMetrics: true
+  certManager:
+    enabled: true
+  volumes:
+    - name: gcloud
+      mountPath: /etc/pwx/gce
+      secret:
+        secretName: px-gcloud
+  env:
+    - name: GOOGLE_APPLICATION_CREDENTIALS
+      value: "/etc/pwx/gce/gcloud.json"

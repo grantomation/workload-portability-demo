@@ -1,0 +1,524 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Installation Dashboard</title>
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <header>
+    <h1>Installation Dashboard</h1>
+    <span class="subtitle">Workload Portability Demo</span>
+  </header>
+
+  <main>
+    <aside id="cluster-sidebar">
+      <button id="home-btn" class="home-btn active">
+        <svg width="16" height="16" viewBox="0 0 16 16" fill="currentColor">
+          <path d="M8 1.4L1.5 7H4v6h3v-4h2v4h3V7h2.5L8 1.4z"/>
+        </svg>
+        Overview
+      </button>
+      <button id="demo-btn" class="home-btn">
+        <svg width="16" height="16" viewBox="0 0 16 16" fill="currentColor">
+          <path d="M4 2l10 6-10 6V2z"/>
+        </svg>
+        Demo Order
+      </button>
+
+      <h2>Clusters</h2>
+      <div id="cluster-list"></div>
+      <button id="add-ocp-btn" class="btn btn-primary">+ Add OpenShift Cluster</button>
+      <button id="add-legacy-btn" class="btn btn-primary">+ Add Legacy Infra Cluster</button>
+
+      <div id="add-ocp-form" class="form-card hidden">
+        <h3>Add OpenShift Cluster</h3>
+        <label>Name<input type="text" id="ocp-name" placeholder="aro-build"></label>
+        <label>API URL<input type="url" id="ocp-api" placeholder="https://api.cluster.example.com:6443"></label>
+        <label>Username<input type="text" id="ocp-user" placeholder="kubeadmin"></label>
+        <label>Password<input type="password" id="ocp-password"></label>
+        <div class="form-actions">
+          <button id="save-ocp-btn" class="btn btn-primary">Add</button>
+          <button id="cancel-ocp-btn" class="btn btn-secondary">Cancel</button>
+        </div>
+      </div>
+
+      <div id="add-legacy-form" class="form-card hidden">
+        <h3>Add Legacy Infra Cluster</h3>
+        <label>Name<input type="text" id="legacy-name" placeholder="Legacy datacenter"></label>
+        <label>Management URL<input type="url" id="legacy-manager" placeholder="https://manager.example.com"></label>
+        <label>Workload URL<input type="url" id="legacy-workload" placeholder="http://192.168.1.50"></label>
+        <label>Username<input type="text" id="legacy-user" placeholder="operator@example.com"></label>
+        <label>Password<input type="password" id="legacy-password"></label>
+        <div class="form-actions">
+          <button id="save-legacy-btn" class="btn btn-primary">Add</button>
+          <button id="cancel-legacy-btn" class="btn btn-secondary">Cancel</button>
+        </div>
+      </div>
+
+      <h2>Global Config</h2>
+      <div id="sidebar-global-config">
+        <div id="sidebar-external-links" style="display:flex;gap:0.35rem;">
+          <a id="link-lb" class="btn btn-sm external-link disabled" title="Loadbalancer not deployed yet">Loadbalancer</a>
+          <a id="link-artifacts" class="btn btn-sm external-link disabled" title="Artifact server not deployed yet">Artifacts</a>
+        </div>
+        <button id="build-lb-btn" class="btn btn-accent" disabled title="Assign the Build role to a cluster first">Build Loadbalancer</button>
+        <button id="onboard-acm-btn" class="btn btn-accent" disabled title="Assign the ACM role to a cluster first">Onboard to ACM</button>
+        <button id="s3-config-btn" class="btn btn-config">S3 Bucket</button>
+        <button id="px-license-btn" class="btn btn-config">PX License Key</button>
+      </div>
+      <div id="s3-config-form" class="form-card hidden">
+        <h3>S3 Bucket Configuration</h3>
+        <p class="form-hint">Required for Portworx DR. Bucket must already exist.</p>
+        <label>Bucket Name<input type="text" id="s3-bucket" placeholder="portworx-dr-backups"></label>
+        <label>Region<input type="text" id="s3-region" placeholder="ap-southeast-2"></label>
+        <label>Endpoint<input type="text" id="s3-endpoint" placeholder="s3.ap-southeast-2.amazonaws.com"></label>
+        <label>Access Key<input type="text" id="s3-access-key" placeholder="AKIA..."></label>
+        <label>Secret Key<input type="password" id="s3-secret-key"></label>
+        <div class="form-actions">
+          <button id="save-s3-btn" class="btn btn-primary">Save</button>
+          <button id="cancel-s3-btn" class="btn btn-secondary">Cancel</button>
+        </div>
+      </div>
+      <div id="px-license-form" class="form-card hidden">
+        <h3>Portworx License Key</h3>
+        <p class="form-hint">Enterprise or Essentials SaaS license key.</p>
+        <label>License Key<input type="password" id="px-license-key"></label>
+        <div class="form-actions">
+          <button id="save-px-btn" class="btn btn-primary">Save</button>
+          <button id="cancel-px-btn" class="btn btn-secondary">Cancel</button>
+        </div>
+      </div>
+    </aside>
+
+    <div id="center-area">
+      <!-- Overview (shown when no cluster selected) -->
+      <div id="overview-panel">
+        <div id="overview-content">
+          <div class="empty-state"><span class="spinner"></span> Loading overview...</div>
+        </div>
+      </div>
+
+      <!-- Demo Order (shown when demo btn clicked) -->
+      <div id="demo-panel" class="hidden">
+        <div id="demo-content">
+          <div style="display:flex;align-items:center;gap:0.75rem">
+            <h2 class="demo-page-title" style="margin:0">Demo Order</h2>
+            <button id="demo-refresh-btn" class="btn btn-sm" onclick="loadDemoPage()" title="Refresh">&#x21bb; Refresh</button>
+          </div>
+          <p class="demo-subtitle">Sequential steps for running the live demo. Press each button when ready.</p>
+
+          <div class="demo-step">
+            <div class="demo-step-number">1</div>
+            <div class="demo-step-body">
+              <h3>Create Disaster Recovery Pairs</h3>
+              <p>Creates DRPs between all Portworx clusters in display order, forming a chain. Uses the configured S3 bucket for async replication.</p>
+              <div class="demo-step-warning">Ensure your cluster order is correct before creating DRPs. The chain follows the display order of Portworx-role clusters.</div>
+              <div id="demo-drp-chain" class="demo-chain"></div>
+              <div class="demo-step-actions">
+                <button id="demo-create-drps-btn" class="btn btn-accent">Create DRPs</button>
+                <button id="demo-delete-drps-btn" class="btn btn-danger btn-sm">Delete All DRPs</button>
+              </div>
+              <div id="demo-drp-status"></div>
+            </div>
+          </div>
+
+          <div class="demo-step">
+            <div class="demo-step-number">2</div>
+            <div class="demo-step-body">
+              <h3>Create Protection Group</h3>
+              <p>Create a PG for a specific hop right before you demo it. This triggers an immediate initial sync.</p>
+              <div id="demo-pg-buttons"></div>
+              <div id="demo-pg-status"></div>
+            </div>
+          </div>
+
+          <div class="demo-step">
+            <div class="demo-step-number">3</div>
+            <div class="demo-step-body">
+              <h3>Prepare On-Prem</h3>
+              <p>Deletes the <code>portable-workload</code> namespace on the last cluster in the chain before migrating back. This avoids resource conflicts when the DR failover lands.</p>
+              <div id="demo-prepare-onprem-target"></div>
+              <div class="demo-step-actions">
+                <button id="demo-prepare-onprem-btn" class="btn btn-danger btn-sm">Delete Namespace</button>
+              </div>
+              <div id="demo-prepare-onprem-status"></div>
+            </div>
+          </div>
+
+          <div class="demo-step">
+            <div class="demo-step-number">4</div>
+            <div class="demo-step-body">
+              <h3>Deep Clean</h3>
+              <p>Scans the hub for DRPs, PGs and DR Actions, then walks every Portworx-role cluster checking <code>portworx</code> and <code>kube-system</code> namespaces for stork artifacts (BackupLocations, ClusterPairs, MigrationSchedules, Migrations, DR secrets) plus cluster-scoped SchedulePolicies. Anything that doesn't match a live DRP/PG UID on the hub is an orphan — typically left behind by the multicluster agent or from manual console deletions.</p>
+              <div class="demo-step-actions">
+                <button id="demo-audit-btn" class="btn btn-sm">Audit</button>
+                <button id="demo-deep-clean-btn" class="btn btn-danger btn-sm">Deep Clean All</button>
+              </div>
+              <div id="demo-audit-results"></div>
+            </div>
+          </div>
+
+        </div>
+      </div>
+
+      <!-- Cluster view (shown when a cluster is selected) -->
+      <div id="cluster-view" class="hidden">
+        <div id="tab-bar">
+          <button class="main-tab active" data-tab="roles">Roles</button>
+          <button class="main-tab hidden" data-tab="build-assets" id="build-assets-tab-btn">Build Assets</button>
+          <button class="main-tab hidden" data-tab="portworx-config" id="portworx-config-tab-btn">Portworx Config</button>
+          <button class="main-tab hidden" data-tab="mtv-guide" id="mtv-guide-tab-btn">MTV Guide</button>
+        </div>
+
+        <div id="tab-panels">
+          <!-- ============ ROLES TAB ============ -->
+          <div id="tab-roles" class="tab-panel active">
+            <div id="roles-main" class="tab-panel-scroll">
+              <div id="roles-no-cluster" class="empty-state">
+                <p>Select a cluster to configure roles and operators</p>
+              </div>
+              <div id="roles-content" class="hidden">
+                <div class="panel-header">
+                  <h2 id="config-cluster-name"></h2>
+                  <div class="panel-actions">
+                    <span id="config-cluster-info" class="cluster-meta"></span>
+                    <button id="scan-btn" class="btn btn-accent">Scan</button>
+                  </div>
+                </div>
+                <div id="config-capacity">
+                  <div class="capacity-bars">
+                    <div class="capacity-bar-group">
+                      <div class="capacity-label">CPU <span id="config-cpu-label"></span></div>
+                      <div class="capacity-bar"><div id="config-cpu-bar" class="capacity-fill"></div></div>
+                    </div>
+                    <div class="capacity-bar-group">
+                      <div class="capacity-label">Memory <span id="config-mem-label"></span></div>
+                      <div class="capacity-bar"><div id="config-mem-bar" class="capacity-fill"></div></div>
+                    </div>
+                  </div>
+                </div>
+                <div id="config-roles-badges" class="role-badges"></div>
+                <h3 class="section-title">Roles</h3>
+                <div id="role-cards"></div>
+              </div>
+            </div>
+          </div>
+
+          <!-- ============ BUILD ASSETS TAB ============ -->
+          <div id="tab-build-assets" class="tab-panel">
+            <div class="tab-panel-scroll">
+              <div class="panel-header">
+                <h2 id="build-cluster-name"></h2>
+                <div class="panel-actions">
+                  <button id="refresh-pipelines-btn" class="btn btn-accent btn-sm">Refresh</button>
+                </div>
+              </div>
+
+              <div class="operate-section">
+                <h3 class="section-title">Pipelines</h3>
+                <div id="pipeline-list"></div>
+              </div>
+
+              <div class="operate-section">
+                <h3 class="section-title">Recent Runs</h3>
+                <div id="pipeline-runs"></div>
+              </div>
+
+            </div>
+          </div>
+
+          <!-- ============ PORTWORX CONFIG TAB ============ -->
+          <div id="tab-portworx-config" class="tab-panel">
+            <div class="tab-panel-scroll">
+              <div class="panel-header">
+                <h2 id="px-config-cluster-name"></h2>
+                <span class="cluster-meta" id="px-config-cluster-info"></span>
+                <button id="px-refresh-btn" class="btn btn-secondary btn-sm">Refresh</button>
+              </div>
+
+              <div class="operate-section">
+                <h3 class="section-title">Portworx Status</h3>
+                <div class="status-row">
+                  <span>Operator</span>
+                  <span id="op-status-operator" class="status-badge unknown">Unknown</span>
+                </div>
+                <div class="status-row">
+                  <span>StorageCluster</span>
+                  <span id="op-status-sc" class="status-badge unknown">Unknown</span>
+                </div>
+                <div class="status-row">
+                  <span>Cloud Credentials</span>
+                  <span id="op-status-creds" class="status-badge unknown">Unknown</span>
+                </div>
+                <div class="status-row">
+                  <span>License</span>
+                  <span id="op-status-license" class="status-badge unknown">Unknown</span>
+                </div>
+              </div>
+
+              <div id="px-creds-section">
+                <h3 class="section-title">Cloud Credentials</h3>
+                <div id="px-creds-card" class="creds-card">
+                  <div class="creds-header">
+                    <span id="px-creds-platform" class="creds-platform"></span>
+                    <span id="px-creds-status" class="status-badge unknown">Not Configured</span>
+                  </div>
+                  <p id="px-creds-hint" class="form-hint"></p>
+
+                  <div id="px-creds-azure" class="creds-fields hidden">
+                    <p class="form-hint">Azure Service Principal credentials. Creates <code>px-azure</code> Secret in the <code>portworx</code> namespace.</p>
+                    <label>Client ID<input type="text" id="px-azure-client-id" placeholder="xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"></label>
+                    <label>Client Secret<input type="password" id="px-azure-client-secret"></label>
+                    <label>Tenant ID<input type="text" id="px-azure-tenant-id" placeholder="xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"></label>
+                  </div>
+
+                  <div id="px-creds-aws-sts" class="creds-fields hidden">
+                    <p class="form-hint">IAM Role ARN for Portworx workload identity (IRSA). Injected into the StorageCluster spec.</p>
+                    <div class="form-hint-cmd">
+                      <span>Find ARN:</span>
+                      <code id="px-aws-sts-cmd"></code>
+                      <button class="btn-copy" onclick="navigator.clipboard.writeText(document.getElementById('px-aws-sts-cmd').textContent)">Copy</button>
+                    </div>
+                    <label>IAM Role ARN<input type="text" id="px-aws-role-arn" placeholder="arn:aws:iam::123456789012:role/portworx-role"></label>
+                  </div>
+
+                  <div id="px-creds-gcp" class="creds-fields hidden">
+                    <p class="form-hint">GCP Service Account JSON key. Creates <code>px-gcloud</code> Secret in the <code>portworx</code> namespace.</p>
+                    <div class="form-hint-cmd">
+                      <span>Generate key:</span>
+                      <code id="px-gcp-cmd"></code>
+                      <button class="btn-copy" onclick="navigator.clipboard.writeText(document.getElementById('px-gcp-cmd').textContent)">Copy</button>
+                    </div>
+                    <p class="form-hint">Paste the contents of the generated JSON file below.</p>
+                    <label>Service Account JSON Key
+                      <textarea id="px-gcp-sa-key" rows="4" placeholder='{"type":"service_account","project_id":"...",...}' class="json-textarea"></textarea>
+                    </label>
+                  </div>
+
+                  <div id="px-creds-aws-iam" class="creds-fields hidden">
+                    <p class="form-hint">Uses IAM instance profile on worker nodes by default. Provide static credentials only if the instance profile lacks EC2 volume permissions.</p>
+                    <div class="creds-iam-default">
+                      <span class="status-badge installed">Using Instance Profile</span>
+                      <button id="px-aws-override-btn" class="btn btn-secondary btn-sm">Override with Static Credentials</button>
+                    </div>
+                    <div id="px-aws-static-fields" class="hidden">
+                      <label>AWS Access Key<input type="text" id="px-aws-access-key" placeholder="AKIA..."></label>
+                      <label>AWS Secret Key<input type="password" id="px-aws-secret-key"></label>
+                    </div>
+                  </div>
+
+                  <div class="form-actions">
+                    <button id="save-px-creds-btn" class="btn btn-primary">Save Credentials</button>
+                  </div>
+                </div>
+              </div>
+
+              <div class="operate-section">
+                <h3 class="section-title">StorageCluster</h3>
+                <div class="operate-actions">
+                  <button id="op-apply-sc-btn" class="btn btn-accent" disabled>Apply StorageCluster</button>
+                  <button id="op-delete-sc-btn" class="btn btn-danger hidden" disabled>Delete StorageCluster</button>
+                  <button id="op-apply-license-btn" class="btn btn-accent" disabled>Apply License</button>
+                </div>
+              </div>
+
+
+            </div>
+          </div>
+
+          <!-- ============ MTV GUIDE TAB ============ -->
+          <div id="tab-mtv-guide" class="tab-panel">
+            <div class="tab-panel-scroll">
+              <div class="panel-header">
+                <h2>MTV Migration Guide</h2>
+              </div>
+
+              <div class="operate-section">
+                <h3 class="section-title">Overview</h3>
+                <p class="guide-text">After MTV is installed and providers are ready, replace <code>&lt;source-provider-name&gt;</code> with the name you configured in MTV, then create the mapping and plan resources below in the <code>openshift-mtv</code> namespace. These cannot be fully automated as they depend on your legacy virtualization environment.</p>
+              </div>
+
+              <div class="operate-section">
+                <h3 class="section-title">1. Create a NetworkMap</h3>
+                <p class="guide-text">Maps the source legacy virtualization network segment to the target cluster networking. Use <strong>pod networking</strong> unless you have Multus/SR-IOV configured.</p>
+                <div class="guide-code-block">
+                  <div class="guide-code-header">
+                    <span>networkmap.yaml</span>
+                    <button class="btn-copy" onclick="copyGuideBlock(this)">Copy</button>
+                  </div>
+                  <pre>apiVersion: forklift.konveyor.io/v1beta1
+kind: NetworkMap
+metadata:
+  name: legacy-to-pod
+  namespace: openshift-mtv
+spec:
+  provider:
+    source:
+      name: &lt;source-provider-name&gt;
+      namespace: openshift-mtv
+    destination:
+      name: host
+      namespace: openshift-mtv
+  map:
+    - source:
+        name: &lt;source-network-segment&gt;
+      destination:
+        type: pod</pre>
+                </div>
+              </div>
+
+              <div class="operate-section">
+                <h3 class="section-title">2. Create a StorageMap</h3>
+                <p class="guide-text">Maps the source legacy virtualization datastore to the target StorageClass. Use <code>px-csi-replicated</code> for Portworx or the default StorageClass for your cluster.</p>
+                <div class="guide-code-block">
+                  <div class="guide-code-header">
+                    <span>storagemap.yaml</span>
+                    <button class="btn-copy" onclick="copyGuideBlock(this)">Copy</button>
+                  </div>
+                  <pre>apiVersion: forklift.konveyor.io/v1beta1
+kind: StorageMap
+metadata:
+  name: legacy-to-portworx
+  namespace: openshift-mtv
+spec:
+  provider:
+    source:
+      name: &lt;source-provider-name&gt;
+      namespace: openshift-mtv
+    destination:
+      name: host
+      namespace: openshift-mtv
+  map:
+    - source:
+        name: &lt;source-datastore&gt;
+      destination:
+        storageClass: px-csi-replicated</pre>
+                </div>
+              </div>
+
+              <div class="operate-section">
+                <h3 class="section-title">3. Create a Migration Plan</h3>
+                <p class="guide-text">References the providers, maps, and source VMs. The target namespace <code>portable-workload</code> is pre-created when MTV is assigned.</p>
+                <div class="guide-important">
+                  <strong>Important:</strong> Set <code>skipGuestConversion: true</code> &mdash; guest conversion is not needed for these VMs and will cause failures if enabled.
+                </div>
+                <div class="guide-code-block">
+                  <div class="guide-code-header">
+                    <span>plan.yaml</span>
+                    <button class="btn-copy" onclick="copyGuideBlock(this)">Copy</button>
+                  </div>
+                  <pre>apiVersion: forklift.konveyor.io/v1beta1
+kind: Plan
+metadata:
+  name: legacy-to-ocp
+  namespace: openshift-mtv
+spec:
+  type: cold
+  warm: false
+  targetNamespace: portable-workload
+  skipGuestConversion: true
+  preserveStaticIPs: false
+  provider:
+    source:
+      name: &lt;source-provider-name&gt;
+      namespace: openshift-mtv
+    destination:
+      name: host
+      namespace: openshift-mtv
+  map:
+    network:
+      name: legacy-to-pod
+      namespace: openshift-mtv
+    storage:
+      name: legacy-to-portworx
+      namespace: openshift-mtv
+  vms:
+    - name: &lt;source-vm-name&gt;
+    - name: &lt;source-vm-name-2&gt;</pre>
+                </div>
+              </div>
+
+              <div class="operate-section">
+                <h3 class="section-title">4. Start the Migration</h3>
+                <p class="guide-text">Start from the MTV UI (Forklift plugin in the OpenShift console) or create a Migration CR:</p>
+                <div class="guide-code-block">
+                  <div class="guide-code-header">
+                    <span>migration.yaml</span>
+                    <button class="btn-copy" onclick="copyGuideBlock(this)">Copy</button>
+                  </div>
+                  <pre>apiVersion: forklift.konveyor.io/v1beta1
+kind: Migration
+metadata:
+  name: legacy-to-ocp-run
+  namespace: openshift-mtv
+spec:
+  plan:
+    name: legacy-to-ocp
+    namespace: openshift-mtv</pre>
+                </div>
+              </div>
+
+              <div class="operate-section">
+                <h3 class="section-title">Pre-created Resources</h3>
+                <p class="guide-text">The following are automatically created when the MTV role is assigned:</p>
+                <ul class="guide-list">
+                  <li><code>portable-workload</code> namespace (migration target)</li>
+                  <li>Forklift controller RBAC in target namespace</li>
+                  <li>Privileged SCC for forklift-controller</li>
+                  <li>Cross-namespace image pull access</li>
+                  <li>KubeVirt admin role for console VM management</li>
+                  <li>Configure the source provider separately in MTV after installation</li>
+                  <li>OpenShift providers for clusters with the virt role</li>
+                </ul>
+              </div>
+
+            </div>
+          </div>
+
+        </div>
+      </div>
+
+    </div>
+
+    <aside id="right-panel">
+      <h3 class="activity-log-title">Activity Log</h3>
+      <div id="log-entries" class="activity-log-entries"></div>
+    </aside>
+  </main>
+
+  <div id="edit-cluster-modal" class="modal hidden">
+    <div class="modal-content">
+      <h3>Edit Cluster</h3>
+      <div id="edit-ocp-fields">
+        <label>API URL<input type="url" id="edit-cluster-api"></label>
+      </div>
+      <div id="edit-legacy-fields" class="hidden">
+        <label>Management URL<input type="url" id="edit-cluster-manager"></label>
+        <label>Workload URL<input type="url" id="edit-cluster-workload"></label>
+      </div>
+      <label>Username<input type="text" id="edit-cluster-user"></label>
+      <label>Password<input type="password" id="edit-cluster-password" placeholder="(unchanged)"></label>
+      <div class="form-actions">
+        <button id="edit-save-btn" class="btn btn-primary">Save</button>
+        <button id="edit-cancel-btn" class="btn btn-secondary">Cancel</button>
+      </div>
+    </div>
+  </div>
+
+  <div id="unassign-modal" class="modal hidden">
+    <div class="modal-content">
+      <h3>Unassign Role</h3>
+      <div id="unassign-warnings"></div>
+      <div id="unassign-details"></div>
+      <div class="form-actions">
+        <button id="unassign-confirm-btn" class="btn btn-danger">Unassign &amp; Uninstall</button>
+        <button id="unassign-cancel-btn" class="btn btn-secondary">Cancel</button>
+      </div>
+    </div>
+  </div>
+
+  <script src="app.js"></script>
+</body>
+</html>

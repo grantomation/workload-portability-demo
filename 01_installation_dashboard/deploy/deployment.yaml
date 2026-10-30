@@ -1,0 +1,86 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: installation-dashboard
+  namespace: workload-portability-build
+  labels:
+    app: installation-dashboard
+  annotations:
+    image.openshift.io/triggers: '[{"from":{"kind":"ImageStreamTag","name":"installation-dashboard:latest"},"fieldPath":"spec.template.spec.containers[?(@.name==\"dashboard\")].image"}]'
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: installation-dashboard
+  template:
+    metadata:
+      labels:
+        app: installation-dashboard
+    spec:
+      serviceAccountName: installation-dashboard
+      containers:
+        - name: dashboard
+          image: image-registry.openshift-image-registry.svc:5000/workload-portability-build/installation-dashboard:latest
+          ports:
+            - containerPort: 8080
+          env:
+            - name: SOURCE_REPO_URL
+              value: "__SOURCE_REPO_URL__"
+            - name: SOURCE_REPO_REVISION
+              value: "__SOURCE_REPO_REVISION__"
+            - name: PORT
+              value: "8080"
+            - name: DATA_DIR
+              value: /data
+            - name: NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+            - name: NODE_TLS_REJECT_UNAUTHORIZED
+              value: "0"
+          volumeMounts:
+            - name: data
+              mountPath: /data
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              memory: 256Mi
+        - name: oauth-proxy
+          image: registry.redhat.io/openshift4/ose-oauth-proxy:v4.14
+          args:
+            - --https-address=:8443
+            - --provider=openshift
+            - --openshift-service-account=installation-dashboard
+            - --upstream=http://localhost:8080
+            - --tls-cert=/etc/tls/private/tls.crt
+            - --tls-key=/etc/tls/private/tls.key
+            - --cookie-secret-file=/etc/proxy/secrets/session_secret
+            - --cookie-refresh=0
+          ports:
+            - containerPort: 8443
+              name: proxy
+          volumeMounts:
+            - name: proxy-tls
+              mountPath: /etc/tls/private
+              readOnly: true
+            - name: proxy-secret
+              mountPath: /etc/proxy/secrets
+              readOnly: true
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              memory: 128Mi
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: installation-dashboard-data
+        - name: proxy-tls
+          secret:
+            secretName: installation-dashboard-tls
+        - name: proxy-secret
+          secret:
+            secretName: installation-dashboard-proxy

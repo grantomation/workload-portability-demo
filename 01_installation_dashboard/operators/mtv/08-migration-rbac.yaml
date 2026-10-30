@@ -1,0 +1,126 @@
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: forklift-controller-edit
+  namespace: portable-workload
+rules:
+  - apiGroups: ["", "apps", "batch", "extensions", "kubevirt.io", "subresources.kubevirt.io", "cdi.kubevirt.io", "networking.k8s.io"]
+    resources: ["*"]
+    verbs: ["*"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: forklift-controller-edit
+  namespace: portable-workload
+subjects:
+  - kind: ServiceAccount
+    name: forklift-controller
+    namespace: openshift-mtv
+roleRef:
+  kind: Role
+  name: forklift-controller-edit
+  apiGroup: rbac.authorization.k8s.io
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: forklift-controller-privileged-scc
+subjects:
+  - kind: ServiceAccount
+    name: forklift-controller
+    namespace: openshift-mtv
+roleRef:
+  kind: ClusterRole
+  name: system:openshift:scc:privileged
+  apiGroup: rbac.authorization.k8s.io
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: portable-workload-image-puller
+  namespace: openshift-mtv
+subjects:
+  - kind: Group
+    name: system:serviceaccounts:portable-workload
+    apiGroup: rbac.authorization.k8s.io
+roleRef:
+  kind: ClusterRole
+  name: system:image-puller
+  apiGroup: rbac.authorization.k8s.io
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: mtv-migration-components-image-puller
+  namespace: workload-portability-build
+subjects:
+  - kind: Group
+    name: system:serviceaccounts:openshift-mtv
+    apiGroup: rbac.authorization.k8s.io
+roleRef:
+  kind: ClusterRole
+  name: system:image-puller
+  apiGroup: rbac.authorization.k8s.io
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: portable-workload-migration-components-image-puller
+  namespace: workload-portability-build
+subjects:
+  - kind: Group
+    name: system:serviceaccounts:portable-workload
+    apiGroup: rbac.authorization.k8s.io
+roleRef:
+  kind: ClusterRole
+  name: system:image-puller
+  apiGroup: rbac.authorization.k8s.io
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: admin-cluster-reader
+subjects:
+  - kind: User
+    name: admin
+    apiGroup: rbac.authorization.k8s.io
+roleRef:
+  kind: ClusterRole
+  name: cluster-reader
+  apiGroup: rbac.authorization.k8s.io
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: kubevirt-admin
+rules:
+  - apiGroups: ["kubevirt.io"]
+    resources:
+      - virtualmachines
+      - virtualmachineinstances
+      - virtualmachineinstancemigrations
+    verbs: ["get", "list", "watch", "patch", "update"]
+  - apiGroups: ["subresources.kubevirt.io"]
+    resources:
+      - virtualmachines/start
+      - virtualmachines/stop
+      - virtualmachines/restart
+      - virtualmachineinstances/vnc
+      - virtualmachineinstances/console
+      - virtualmachineinstances/pause
+      - virtualmachineinstances/unpause
+    verbs: ["get", "update"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: admin-kubevirt-admin
+subjects:
+  - kind: User
+    name: admin
+    apiGroup: rbac.authorization.k8s.io
+roleRef:
+  kind: ClusterRole
+  name: kubevirt-admin
+  apiGroup: rbac.authorization.k8s.io

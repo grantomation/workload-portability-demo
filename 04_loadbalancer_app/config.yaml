@@ -1,0 +1,14 @@
+title: "Application LB"
+initialActive: 1
+domain: localhost
+
+nodes:
+  - name: "Node 1\n(Default)"
+    position: 1
+    icon: baremetal
+    url: http://localhost:9090/1
+
+  - name: "Node 2"
+    position: 2
+    icon: cloud
+    url: http://localhost:9090/2

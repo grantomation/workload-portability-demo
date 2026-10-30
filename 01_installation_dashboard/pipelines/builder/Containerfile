@@ -1,0 +1,10 @@
+FROM registry.fedoraproject.org/fedora:44
+
+RUN dnf install -y \
+        guestfs-tools \
+        qemu-img \
+        curl \
+    && dnf clean all \
+    && rm -rf /var/cache/dnf
+
+ENV LIBGUESTFS_BACKEND=direct

@@ -1,0 +1,59 @@
+# SOURCE: https://install.portworx.com/3.6?operator=true&mc=false&kbver=1.34.0&ns=portworx&b=true&kvdbtls=true&certmgr=true&iop=6&s=%22type%3DPremium_LRS%2Csize%3D150%22&ce=azure&dmthin=true&c=px-cluster-4160f27f-26d1-44d4-b5e1-5dc826e458fa&aks=true&osft=true&nopxproxy=true&stork=true&csi=true&mon=true&aut=true&tel=true&st=k8s&promop=true
+kind: StorageCluster
+apiVersion: core.libopenstorage.org/v1
+metadata:
+  name: px-cluster-4160f27f-26d1-44d4-b5e1-5dc826e458fa
+  namespace: portworx
+  annotations:
+    portworx.io/install-source: "https://install.portworx.com/3.6?operator=true&mc=false&kbver=1.34.0&ns=portworx&b=true&kvdbtls=true&certmgr=true&iop=6&s=%22type%3DPremium_LRS%2Csize%3D150%22&ce=azure&dmthin=true&c=px-cluster-4160f27f-26d1-44d4-b5e1-5dc826e458fa&aks=true&osft=true&nopxproxy=true&stork=true&csi=true&mon=true&aut=true&tel=true&st=k8s&promop=true"
+    portworx.io/is-openshift: "true"
+    portworx.io/is-aks: "true"
+    portworx.io/misc-args: " -T px-storev2 "
+    portworx.io/preflight-check: "true"
+    portworx.io/portworx-proxy: "false"
+    portworx.io/service-type: "portworx-api:LoadBalancer"
+spec:
+  image: docker.io/portworx/oci-monitor:3.6.2
+  imagePullPolicy: Always
+  kvdb:
+    internal: true
+    enableTLS: true
+  cloudStorage:
+    deviceSpecs:
+    - type=Premium_LRS,size=150
+  secretsProvider: k8s
+  stork:
+    enabled: true
+    args:
+      webhook-controller: "true"
+      admin-namespace: "portworx"
+  autopilot:
+    enabled: true
+  runtimeOptions:
+    default-io-profile: "6"
+  csi:
+    enabled: true
+  monitoring:
+    telemetry:
+      enabled: true
+    prometheus:
+      enabled: true
+      exportMetrics: true
+  certManager:
+    enabled: true
+  env:
+  - name: AZURE_CLIENT_ID
+    valueFrom:
+      secretKeyRef:
+        name: px-azure
+        key: AZURE_CLIENT_ID
+  - name: AZURE_CLIENT_SECRET
+    valueFrom:
+      secretKeyRef:
+        name: px-azure
+        key: AZURE_CLIENT_SECRET
+  - name: AZURE_TENANT_ID
+    valueFrom:
+      secretKeyRef:
+        name: px-azure
+        key: AZURE_TENANT_ID

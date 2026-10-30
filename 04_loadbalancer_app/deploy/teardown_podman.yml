@@ -1,0 +1,29 @@
+---
+- name: Tear down Faux LB Podman Deployment and Clean Hosts
+  hosts: localhost
+  connection: local
+  gather_facts: false
+
+  vars:
+    app_dir: "{{ playbook_dir }}/.."
+
+  tasks:
+    - name: Tear down existing Podman deployment
+      ansible.builtin.command: podman play kube --down {{ app_dir }}/deployment.yaml
+      failed_when: false
+      changed_when: true
+      register: play_output
+
+    - name: Show podman output
+      ansible.builtin.debug:
+        var: play_output.stdout_lines
+
+    - name: Remove hosts entries using existing script
+      ansible.builtin.command: "{{ app_dir }}/hosts.sh remove"
+      failed_when: false
+      changed_when: true
+      register: hosts_output
+
+    - name: Show hosts.sh output
+      ansible.builtin.debug:
+        var: hosts_output.stdout_lines

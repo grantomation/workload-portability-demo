@@ -1,0 +1,26 @@
+apiVersion: tekton.dev/v1
+kind: Pipeline
+metadata:
+  name: dash-onboard-acm-clusters
+  annotations:
+    description: >-
+      Reads cluster data from the installation dashboard, identifies the ACM hub,
+      and imports all other OpenShift clusters as ManagedClusters via auto-import.
+      Triggered independently from the installation app "Onboard to ACM" button.
+    dependencies: "none"
+spec:
+  description: >-
+    1. onboard-clusters — Read clusters Secret, log into hub, create ManagedCluster + auto-import-secret for each spoke
+  params:
+    - name: namespace
+      type: string
+      description: Target namespace
+      default: "workload-portability-build"
+
+  tasks:
+    - name: onboard-clusters
+      taskRef:
+        name: onboard-clusters-to-acm
+      params:
+        - name: namespace
+          value: $(params.namespace)

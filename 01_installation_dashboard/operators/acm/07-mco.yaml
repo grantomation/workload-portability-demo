@@ -1,0 +1,13 @@
+apiVersion: observability.open-cluster-management.io/v1beta2
+kind: MultiClusterObservability
+metadata:
+  name: observability
+  annotations:
+    installation-dashboard/s3-bucket: "{{config.s3.bucket}}"
+spec:
+  imagePullSecret: multiclusterhub-operator-pull-secret
+  observabilityAddonSpec: {}
+  storageConfig:
+    metricObjectStorage:
+      name: thanos-object-storage
+      key: thanos.yaml

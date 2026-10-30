@@ -1,0 +1,98 @@
+apiVersion: tekton.dev/v1
+kind: Pipeline
+metadata:
+  name: dash-build-deploy-lb
+  annotations:
+    description: >-
+      Generates loadbalancer config from installation dashboard cluster data,
+      builds the faux-loadbalancer container image, and deploys it on the build cluster.
+      Triggered independently from the installation app "Build Loadbalancer" button.
+    dependencies: "none"
+spec:
+  description: >-
+    1. clone — Git clone the repo
+    2. generate-lb-config — Read clusters Secret, discover apps domains, create ConfigMap
+    3. build-loadbalancer — Build container image from 04_loadbalancer_app
+    4. deploy-loadbalancer — Deploy Deployment + Service + Route
+  params:
+    - name: git-url
+      type: string
+      description: Git repository URL
+      default: "__SOURCE_REPO_URL__"
+    - name: git-revision
+      type: string
+      description: Branch or commit to build from
+      default: "__SOURCE_REPO_REVISION__"
+    - name: image-registry
+      type: string
+      description: Internal registry path (no trailing slash)
+      default: "image-registry.openshift-image-registry.svc:5000/workload-portability-build"
+    - name: namespace
+      type: string
+      description: Target namespace for deployment
+      default: "workload-portability-build"
+
+  workspaces:
+    - name: shared-workspace
+      description: Workspace for cloned source code (PVC)
+
+  tasks:
+    # Step 1: Clone git repo
+    - name: clone
+      taskRef:
+        resolver: cluster
+        params:
+          - name: kind
+            value: task
+          - name: name
+            value: git-clone
+          - name: namespace
+            value: openshift-pipelines
+      workspaces:
+        - name: output
+          workspace: shared-workspace
+      params:
+        - name: URL
+          value: $(params.git-url)
+        - name: REVISION
+          value: $(params.git-revision)
+        - name: DELETE_EXISTING
+          value: "false"
+
+    # Step 2: Generate config from cluster data (parallel with clone)
+    - name: generate-lb-config
+      taskRef:
+        name: generate-lb-config
+      params:
+        - name: namespace
+          value: $(params.namespace)
+
+    # Step 3: Build container image (after clone)
+    - name: build-loadbalancer
+      runAfter:
+        - clone
+      taskRef:
+        name: build-loadbalancer
+      workspaces:
+        - name: source
+          workspace: shared-workspace
+      params:
+        - name: image-registry
+          value: $(params.image-registry)
+        - name: image-tag
+          value: $(tasks.clone.results.COMMIT)
+
+    # Step 4: Deploy everything (after build + config generation)
+    - name: deploy-loadbalancer
+      runAfter:
+        - build-loadbalancer
+        - generate-lb-config
+      taskRef:
+        name: deploy-loadbalancer
+      params:
+        - name: namespace
+          value: $(params.namespace)
+        - name: image-registry
+          value: $(params.image-registry)
+        - name: apps-domain
+          value: $(tasks.generate-lb-config.results.apps-domain)

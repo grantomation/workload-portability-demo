@@ -1,0 +1,16 @@
+{
+  "name": "portable-workload",
+  "version": "1.0.0",
+  "description": "Two-tier infrastructure-migration map (web + PostgreSQL)",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "express": "^4.21.2",
+    "pg": "^8.13.1"
+  }
+}

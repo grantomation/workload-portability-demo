@@ -1,0 +1,278 @@
+namespace: workload-portability-build
+consoleRoutePrefix: console-openshift-console
+clustersSecret: installation-dashboard-clusters
+configSecret: installation-dashboard-config
+
+roles:
+  build:
+    name: Build
+    description: CI/CD build server with Tekton Pipelines and OpenShift Virtualization
+    operators:
+      - pipelines
+      - virt
+    extras:
+      - Deployment Pipelines
+  mtv:
+    name: MTV
+    description: VM migration target with Migration Toolkit for Virtualization
+    operators:
+      - virt
+      - mtv
+  acm:
+    name: ACM
+    description: Advanced Cluster Management hub for multi-cluster management
+    operators:
+      - acm
+      - virt
+      - mtv
+      - px-multicluster
+    hubManaged:
+      - virt
+      - mtv
+  virt:
+    name: Virtualization
+    description: Workload cluster running virtual machines
+    operators:
+      - virt
+  portworx:
+    name: Portworx
+    description: Persistent storage and disaster recovery with Portworx Enterprise
+    operators:
+      - storage
+
+sharedNamespaces:
+  - openshift-operators
+  - openshift-marketplace
+
+pipelines:
+  lbRoutePrefix: loadbalancer
+  lbEventListener: el-lb-build-listener
+  acmEventListener: el-acm-onboard-listener
+  acmStatusConfigMap: acm-onboard-status
+  licenseTask: dash-px-license-activate
+  workspacePvc: wp-build-workspace
+
+operators:
+  pipelines:
+    name: OpenShift Pipelines
+    namespace: openshift-operators
+    csvPrefix: openshift-pipelines-operator-rh
+    consolePlugin: pipelines-console-plugin
+    resources:
+      cpu: 0.5
+      memory: 1
+    crCheck:
+      group: operator.tekton.dev
+      version: v1alpha1
+      resource: tektonconfigs
+      name: config
+      clusterScoped: true
+    crdGroups:
+      - operator.tekton.dev
+      - tekton.dev
+    webhookPrefixes:
+      - tekton.dev
+      - operator.tekton.dev
+  virt:
+    name: OpenShift Virtualization
+    namespace: openshift-cnv
+    csvPrefix: kubevirt-hyperconverged-operator
+    resources:
+      cpu: 2
+      memory: 4
+    crCheck:
+      group: hco.kubevirt.io
+      version: v1beta1
+      resource: hyperconvergeds
+      name: kubevirt-hyperconverged
+    crdGroups:
+      - hco.kubevirt.io
+      - kubevirt.io
+      - cdi.kubevirt.io
+      - ssp.kubevirt.io
+      - networkaddonsoperator.network.kubevirt.io
+      - instancetype.kubevirt.io
+      - migrations.kubevirt.io
+      - pool.kubevirt.io
+      - clone.kubevirt.io
+      - export.kubevirt.io
+      - snapshot.kubevirt.io
+    webhookPrefixes:
+      - kubevirt.io
+      - hco.kubevirt.io
+      - cdi.kubevirt.io
+      - ssp.kubevirt.io
+  mtv:
+    name: Migration Toolkit for Virtualization
+    namespace: openshift-mtv
+    csvPrefix: mtv-operator
+    resources:
+      cpu: 1
+      memory: 2
+    crCheck:
+      group: forklift.konveyor.io
+      version: v1beta1
+      resource: forkliftcontrollers
+      name: forklift-controller
+    crdGroups:
+      - forklift.konveyor.io
+    webhookPrefixes:
+      - forklift.konveyor.io
+  acm:
+    name: Advanced Cluster Management
+    namespace: open-cluster-management
+    csvPrefix: advanced-cluster-management
+    resources:
+      cpu: 8
+      memory: 16
+    crCheck:
+      group: operator.open-cluster-management.io
+      version: v1
+      resource: multiclusterhubs
+      name: multiclusterhub
+    crdGroups:
+      - operator.open-cluster-management.io
+      - cluster.open-cluster-management.io
+      - policy.open-cluster-management.io
+      - app.open-cluster-management.io
+      - observability.open-cluster-management.io
+    webhookPrefixes:
+      - open-cluster-management.io
+  storage:
+    name: Portworx
+    namespace: portworx
+    csvPrefix: portworx-operator
+    consolePlugin: portworx
+    resources:
+      cpu: 2
+      memory: 4
+    crCheck:
+      group: core.libopenstorage.org
+      version: v1
+      resource: storageclusters
+    crdGroups:
+      - core.libopenstorage.org
+      - stork.libopenstorage.org
+      - portworx.io
+    webhookPrefixes:
+      - libopenstorage.org
+      - portworx.io
+  px-multicluster:
+    name: Portworx Multi-Cluster
+    namespace: portworx
+    csvPrefix: portworx-multi-cluster-certified
+    consolePlugin: px-multi-cluster-plugin
+    resources:
+      cpu: 0.5
+      memory: 1
+    crCheck:
+      group: multicluster.portworx.com
+      version: v1alpha1
+      resource: clusters
+    crdGroups:
+      - multicluster.portworx.com
+    webhookPrefixes:
+      - multicluster.portworx.com
+
+s3:
+  bucket: ""
+  region: ""
+  endpoint: ""
+  accessKey: ""
+  secretKey: ""
+
+portworx:
+  storkClusterRole: cluster-admin
+  specDir: portworx
+  dr:
+    apiGroup: multicluster.portworx.com
+    apiVersion: v1alpha1
+    namespace: portworx
+    protectedNamespace: portable-workload
+    intervalMinutes: 15
+  minWorkers: 3
+  excludeTaints:
+    - key: node-role.kubernetes.io/infra
+      effect: NoSchedule
+  prereqMessages:
+    baremetal: "bare-metal worker(s). Portworx will use local storage devices."
+    unknown: "worker(s) on {{platform}}. Platform-specific storage configuration may be needed."
+  platformDetection:
+    - platform: Azure
+      key: azure
+    - platform: AWS
+      key: aws-sts-existing-cm
+      matchSts: true
+      matchCertManager: true
+    - platform: AWS
+      key: aws-sts
+      matchSts: true
+      matchCertManager: false
+    - platform: AWS
+      key: aws
+      matchSts: false
+    - platform: GCP
+      key: gcp
+  platforms:
+    azure:
+      spec: aro_portworx_enterprise/portworx_enterprise.yaml
+      credentialMode: secret
+      secret:
+        name: px-azure
+        namespace: portworx
+        keys:
+          AZURE_CLIENT_ID: clientId
+          AZURE_CLIENT_SECRET: clientSecret
+          AZURE_TENANT_ID: tenantId
+      prereqs:
+        credentialSecret:
+          namespace: kube-system
+          name: azure-credentials
+          requiredKeys:
+            - azure_client_id
+            - azure_client_secret
+          missingMessage: "This ARO cluster appears to use managed identity. Portworx requires ARO clusters built with a service principal — managed identity is not supported because Portworx expects it on worker nodes, which ARO does not allow. Rebuild the cluster with --client-id and --client-secret flags."
+          emptyMessage: "ARO service principal credentials are empty in the azure-credentials secret. Portworx cannot provision cloud drives without a valid service principal. Managed identity is not supported on ARO."
+        readyMessage: "worker(s) on Azure (ARO). Service principal detected. Azure credentials (tenant ID, client ID, client secret) will be needed for the px-azure secret."
+    aws-sts-existing-cm:
+      spec: ocp_aws_portworx_enterprise/portworx_enterprise.yaml
+      credentialMode: workloadIdentity
+      workloadIdentity:
+        cloudProvider: aws
+        key: eks.amazonaws.com/role-arn
+        credField: roleArn
+      helpCommand: "aws iam list-roles --query \"Roles[?contains(RoleName, 'ortworx') && contains(to_string(AssumeRolePolicyDocument), '{{oidcIssuer}}')].Arn\" --output text"
+      prereqs:
+        readyMessage: "worker(s) on AWS (STS, cert-manager detected). AWS IAM credentials will be needed for EBS cloud drive provisioning."
+    aws-sts:
+      spec: rosa_portworx_enterprise/portworx_enterprise.yaml
+      credentialMode: workloadIdentity
+      workloadIdentity:
+        cloudProvider: aws
+        key: eks.amazonaws.com/role-arn
+        credField: roleArn
+      helpCommand: "aws iam list-roles --query \"Roles[?contains(RoleName, 'ortworx') && contains(to_string(AssumeRolePolicyDocument), '{{oidcIssuer}}')].Arn\" --output text"
+      prereqs:
+        readyMessage: "worker(s) on AWS. AWS IAM credentials will be needed for EBS cloud drive provisioning."
+    aws:
+      spec: ocp_aws_portworx_enterprise/portworx_enterprise.yaml
+      credentialMode: secret
+      secret:
+        name: px-aws
+        namespace: portworx
+        keys:
+          AWS_ACCESS_KEY_ID: accessKeyId
+          AWS_SECRET_ACCESS_KEY: secretAccessKey
+      prereqs:
+        readyMessage: "worker(s) on AWS. AWS IAM credentials will be needed for EBS cloud drive provisioning."
+    gcp:
+      spec: gcp_portworx_enterprise/portworx_enterprise.yaml
+      credentialMode: secret
+      secret:
+        name: px-gcloud
+        namespace: portworx
+        keys:
+          gcloud.json: jsonKey
+      helpCommand: "gcloud iam service-accounts keys create /dev/stdout --iam-account=portworx@<your-gcp-project>.iam.gserviceaccount.com 2>/dev/null"
+      prereqs:
+        readyMessage: "worker(s) on GCP. GCP service account credentials will be needed for persistent disk provisioning."

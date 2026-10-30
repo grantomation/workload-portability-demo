@@ -1,0 +1,11 @@
+apiVersion: operators.coreos.com/v1alpha1
+kind: Subscription
+metadata:
+  name: portworx-multi-cluster-certified
+  namespace: portworx
+spec:
+  channel: stable
+  installPlanApproval: Automatic
+  name: portworx-multi-cluster-certified
+  source: certified-operators
+  sourceNamespace: openshift-marketplace

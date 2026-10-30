@@ -1,0 +1,26 @@
+apiVersion: multicluster.portworx.com/v1alpha1
+kind: ProtectionGroup
+metadata:
+  name: {{pg.name}}
+  namespace: portworx
+spec:
+  disasterRecoveryPairRef: {{drp.name}}
+  namespaceSelection:
+    namespaces:
+    - {{config.portworx.dr.protectedNamespace}}
+  replicationSchedulePolicy:
+    interval:
+      intervalMinutes: {{config.portworx.dr.intervalMinutes}}
+  resourceConfiguration:
+    includeAllResources: true
+    customSelection:
+      includeApplicationVolumes: true
+      includeCIDRBasedNetworkPolicies: true
+  advanceConfiguration:
+    applicationLifecycleHooks: {}
+    ignoreDeletedNamespacesAtSource: true
+    ignoreOwnerReferencesValidation: false
+    purgeDeletedResourcesAtSource: false
+    skipServiceUpdate: true
+  migrationConfiguration:
+    startApplications: false

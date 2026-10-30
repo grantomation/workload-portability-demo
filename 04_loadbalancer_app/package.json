@@ -1,0 +1,13 @@
+{
+  "name": "faux-loadbalancer",
+  "version": "1.0.0",
+  "description": "Containerized Layer 7 reverse proxy and visual control plane for infrastructure migration demos. Zero dependencies.",
+  "private": true,
+  "bin": { "faux-lb": "server.js" },
+  "scripts": {
+    "start": "node server.js",
+    "targets": "node test/dummy-targets.js",
+    "test": "node test/harness.js"
+  },
+  "engines": { "node": ">=18" }
+}

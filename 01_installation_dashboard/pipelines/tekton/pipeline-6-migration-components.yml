@@ -1,0 +1,29 @@
+apiVersion: tekton.dev/v1
+kind: Pipeline
+metadata:
+  name: 6-build-migration-components-image
+  annotations:
+    description: >-
+      Builds the Migration Components container image from the user-supplied component archive on
+      the artifact server and pushes it to the internal registry.
+      Grants pull access so any namespace (including openshift-mtv) can use it.
+    dependencies: "pipeline 5 (artifact server must be deployed with Migration Components tarball uploaded)"
+spec:
+  description: >-
+    Migration Components image pipeline:
+    1. Build the Migration Components container image from the tarball on the artifacts PVC
+    2. Push to the internal registry
+    3. Grant image pull access to all authenticated users
+  params:
+    - name: namespace
+      type: string
+      description: Build namespace
+      default: "workload-portability-build"
+
+  tasks:
+    - name: build-migration-components-image
+      taskRef:
+        name: build-migration-components-image
+      params:
+        - name: namespace
+          value: $(params.namespace)

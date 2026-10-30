@@ -1,0 +1,45 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: portable-workload
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: pw-backend-svc
+  namespace: portable-workload
+spec:
+  selector:
+    app: pw-backend
+  ports:
+    - name: postgres
+      port: 5432
+      targetPort: 5432
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: pw-frontend-svc
+  namespace: portable-workload
+spec:
+  selector:
+    app: pw-frontend
+  ports:
+    - name: http
+      port: 80
+      targetPort: 80
+---
+apiVersion: route.openshift.io/v1
+kind: Route
+metadata:
+  name: portable-workload-vm
+  namespace: portable-workload
+spec:
+  to:
+    kind: Service
+    name: pw-frontend-svc
+  port:
+    targetPort: http
+  tls:
+    termination: edge
+    insecureEdgeTerminationPolicy: Redirect

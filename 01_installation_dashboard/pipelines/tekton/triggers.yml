@@ -1,0 +1,91 @@
+apiVersion: triggers.tekton.dev/v1beta1
+kind: TriggerTemplate
+metadata:
+  name: lb-build-template
+spec:
+  resourcetemplates:
+    - apiVersion: tekton.dev/v1
+      kind: PipelineRun
+      metadata:
+        generateName: dash-build-deploy-lb-
+      spec:
+        pipelineRef:
+          name: dash-build-deploy-lb
+        params:
+          - name: git-url
+            value: "__SOURCE_REPO_URL__"
+          - name: git-revision
+            value: "__SOURCE_REPO_REVISION__"
+          - name: image-registry
+            value: "image-registry.openshift-image-registry.svc:5000/workload-portability-build"
+        workspaces:
+          - name: shared-workspace
+            persistentVolumeClaim:
+              claimName: wp-build-workspace
+---
+apiVersion: triggers.tekton.dev/v1beta1
+kind: EventListener
+metadata:
+  name: lb-build-listener
+spec:
+  serviceAccountName: pipeline
+  triggers:
+    - name: lb-build
+      template:
+        ref: lb-build-template
+---
+apiVersion: route.openshift.io/v1
+kind: Route
+metadata:
+  name: el-lb-build-listener
+spec:
+  to:
+    kind: Service
+    name: el-lb-build-listener
+  port:
+    targetPort: http-listener
+  tls:
+    termination: edge
+    insecureEdgeTerminationPolicy: Redirect
+---
+apiVersion: triggers.tekton.dev/v1beta1
+kind: TriggerTemplate
+metadata:
+  name: acm-onboard-template
+spec:
+  resourcetemplates:
+    - apiVersion: tekton.dev/v1
+      kind: PipelineRun
+      metadata:
+        generateName: dash-onboard-acm-clusters-
+      spec:
+        pipelineRef:
+          name: dash-onboard-acm-clusters
+        params:
+          - name: namespace
+            value: "workload-portability-build"
+---
+apiVersion: triggers.tekton.dev/v1beta1
+kind: EventListener
+metadata:
+  name: acm-onboard-listener
+spec:
+  serviceAccountName: pipeline
+  triggers:
+    - name: acm-onboard
+      template:
+        ref: acm-onboard-template
+---
+apiVersion: route.openshift.io/v1
+kind: Route
+metadata:
+  name: el-acm-onboard-listener
+spec:
+  to:
+    kind: Service
+    name: el-acm-onboard-listener
+  port:
+    targetPort: http-listener
+  tls:
+    termination: edge
+    insecureEdgeTerminationPolicy: Redirect

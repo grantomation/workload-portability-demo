@@ -1,0 +1,19 @@
+apiVersion: multicluster.portworx.com/v1alpha1
+kind: DisasterRecoveryPair
+metadata:
+  name: {{drp.name}}
+  namespace: portworx
+spec:
+  sourceCluster: {{drp.src}}
+  destinationCluster: {{drp.dst}}
+  disasterRecoveryType: ASYNC
+  pairType: BI-DIRECTIONAL
+  backupLocation:
+    type: s3
+    s3Config:
+      accessKeyID: {{config.s3.accessKey}}
+      secretAccessKey: {{config.s3.secretKey}}
+      endpoint: {{config.s3.endpoint}}
+      region: {{config.s3.region}}
+      bucketName: {{config.s3.bucket}}
+      disableSSL: false

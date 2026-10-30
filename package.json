@@ -1,0 +1,8 @@
+{
+  "private": true,
+  "description": "S2I build delegate — installs and runs 01_installation_dashboard",
+  "scripts": {
+    "postinstall": "cd 01_installation_dashboard/app && npm install --production",
+    "start": "node 01_installation_dashboard/app/server.js"
+  }
+}

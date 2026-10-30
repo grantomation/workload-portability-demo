@@ -1,0 +1,30 @@
+apiVersion: tekton.dev/v1
+kind: Pipeline
+metadata:
+  name: mtv-target-routes
+  annotations:
+    description: >-
+      Creates routes in the portable-workload namespace for every non-Legacy Infra
+      cluster in the installation dashboard. Each route has an explicit host
+      set to portable-workload-vm.<apps-domain> so that when Portworx migrates
+      the namespace, the correct route already exists on the destination cluster.
+    dependencies: "Target namespace (portable-workload) must exist"
+spec:
+  description: >-
+    MTV target routes pipeline:
+    1. Read clusters from installation-dashboard-clusters secret
+    2. Derive apps domain from each cluster API URL (api.X -> apps.X)
+    3. Create a route per cluster in portable-workload with explicit host
+  params:
+    - name: namespace
+      type: string
+      description: Build namespace
+      default: "workload-portability-build"
+
+  tasks:
+    - name: create-target-routes
+      taskRef:
+        name: create-mtv-target-routes
+      params:
+        - name: namespace
+          value: $(params.namespace)

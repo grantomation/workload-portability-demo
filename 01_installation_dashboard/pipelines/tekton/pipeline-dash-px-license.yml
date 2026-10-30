@@ -1,0 +1,26 @@
+apiVersion: tekton.dev/v1
+kind: Pipeline
+metadata:
+  name: dash-px-license-activate
+  annotations:
+    description: >-
+      Activates Portworx license on all clusters with the Portworx role.
+      Reads the license key from dashboard config and cluster credentials
+      from the clusters Secret, then runs pxctl license activate on each.
+    dependencies: "none"
+spec:
+  description: >-
+    1. dash-px-license-activate — Read config + clusters, login to each PX cluster, activate license
+  params:
+    - name: namespace
+      type: string
+      description: Namespace containing dashboard secrets
+      default: "workload-portability-build"
+
+  tasks:
+    - name: activate-license
+      taskRef:
+        name: dash-px-license-activate
+      params:
+        - name: namespace
+          value: $(params.namespace)

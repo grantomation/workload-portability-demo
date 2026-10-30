@@ -1,0 +1,13 @@
+{
+  "name": "installation-dashboard",
+  "version": "1.0.0",
+  "description": "OpenShift operator installation dashboard for the portable-workload demo",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "express": "^4.21.0",
+    "js-yaml": "^5.2.3"
+  }
+}

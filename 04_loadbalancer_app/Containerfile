@@ -1,0 +1,5 @@
+FROM registry.access.redhat.com/hi/nodejs:22
+WORKDIR /app
+COPY package.json server.js dashboard.html config.yaml ./
+EXPOSE 8080
+CMD ["node", "server.js"]

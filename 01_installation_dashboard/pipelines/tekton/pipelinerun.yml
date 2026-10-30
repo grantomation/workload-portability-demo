@@ -1,0 +1,148 @@
+# Pipeline 1: Build the golden-builder container image (Fedora + guestfs-tools)
+# Run first. Only needs re-running if build tools change.
+apiVersion: tekton.dev/v1
+kind: PipelineRun
+metadata:
+  generateName: 1-build-vm-builder-image-
+spec:
+  pipelineRef:
+    name: 1-build-vm-builder-image
+  params:
+    - name: git-url
+      value: "__SOURCE_REPO_URL__"
+    - name: git-revision
+      value: "__SOURCE_REPO_REVISION__"
+    - name: image-registry
+      value: "image-registry.openshift-image-registry.svc:5000/workload-portability-build"
+  workspaces:
+    - name: shared-workspace
+      persistentVolumeClaim:
+        claimName: wp-build-workspace
+---
+# Pipeline 2: Build the backend VM (PostgreSQL + Avahi)
+# Requires pipeline 1 to have run (golden-builder image must exist).
+# Outputs pw_backend.qcow2/.vmdk in artifacts/
+apiVersion: tekton.dev/v1
+kind: PipelineRun
+metadata:
+  generateName: 2-build-backend-vm-
+spec:
+  pipelineRef:
+    name: 2-build-backend-vm
+  params:
+    - name: git-url
+      value: "__SOURCE_REPO_URL__"
+    - name: git-revision
+      value: "__SOURCE_REPO_REVISION__"
+    - name: alpine-rel
+      value: "3.21.2"
+    - name: namespace
+      value: "workload-portability-build"
+  workspaces:
+    - name: shared-workspace
+      persistentVolumeClaim:
+        claimName: wp-build-workspace
+---
+# Pipeline 3: Build the frontend VM (Node.js + app + Avahi)
+# Requires pipeline 1 to have run (golden-builder image must exist).
+# Outputs pw_frontend.qcow2/.vmdk in artifacts/
+apiVersion: tekton.dev/v1
+kind: PipelineRun
+metadata:
+  generateName: 3-build-frontend-vm-
+spec:
+  pipelineRef:
+    name: 3-build-frontend-vm
+  params:
+    - name: git-url
+      value: "__SOURCE_REPO_URL__"
+    - name: git-revision
+      value: "__SOURCE_REPO_REVISION__"
+    - name: alpine-rel
+      value: "3.21.2"
+    - name: namespace
+      value: "workload-portability-build"
+  workspaces:
+    - name: shared-workspace
+      persistentVolumeClaim:
+        claimName: wp-build-workspace
+---
+# Pipeline 4: VM tests (OpenShift + Legacy Infra)
+# Requires pipelines 2 and 3 to have run (VM disk images must exist).
+# Packages VMs as containerDisk images, deploys on OpenShift Virt,
+# tests Service DNS, app API, and Legacy Infra readiness (Avahi, hostname, services).
+# Cleans up all test VMs on success.
+apiVersion: tekton.dev/v1
+kind: PipelineRun
+metadata:
+  generateName: 4-vm-tests-
+spec:
+  pipelineRef:
+    name: 4-vm-tests
+  params:
+    - name: namespace
+      value: "workload-portability-build"
+    - name: image-registry
+      value: "image-registry.openshift-image-registry.svc:5000/workload-portability-build"
+  workspaces:
+    - name: shared-workspace
+      persistentVolumeClaim:
+        claimName: wp-build-workspace
+---
+# Pipeline 5: Deploy the artifact server
+# Creates the artifacts PVC, copies VM images from the build workspace,
+# deploys httpd with oauth-proxy and an HTTPS Route, and verifies files
+# are downloadable.
+apiVersion: tekton.dev/v1
+kind: PipelineRun
+metadata:
+  generateName: 5-deploy-artifact-server-
+spec:
+  pipelineRef:
+    name: 5-deploy-artifact-server
+  params:
+    - name: namespace
+      value: "workload-portability-build"
+  workspaces:
+    - name: shared-workspace
+      persistentVolumeClaim:
+        claimName: wp-build-workspace
+---
+# Pipeline: Build and deploy the loadbalancer (dash-)
+# Generates config from installation dashboard clusters, builds the container,
+# and deploys to the build cluster. Normally triggered from the installation
+# app's "Build Loadbalancer" button via EventListener.
+apiVersion: tekton.dev/v1
+kind: PipelineRun
+metadata:
+  generateName: dash-build-deploy-lb-
+spec:
+  pipelineRef:
+    name: dash-build-deploy-lb
+  params:
+    - name: git-url
+      value: "__SOURCE_REPO_URL__"
+    - name: git-revision
+      value: "__SOURCE_REPO_REVISION__"
+    - name: image-registry
+      value: "image-registry.openshift-image-registry.svc:5000/workload-portability-build"
+  workspaces:
+    - name: shared-workspace
+      persistentVolumeClaim:
+        claimName: wp-build-workspace
+---
+# Pipeline: Onboard clusters to ACM (dash-)
+# Reads cluster data from the installation dashboard Secret, identifies the
+# ACM hub, and imports all other OpenShift clusters as ManagedClusters.
+# Normally triggered from the installation app's "Onboard to ACM" button
+# via EventListener.
+apiVersion: tekton.dev/v1
+kind: PipelineRun
+metadata:
+  generateName: dash-onboard-acm-clusters-
+spec:
+  pipelineRef:
+    name: dash-onboard-acm-clusters
+  params:
+    - name: namespace
+      value: "workload-portability-build"

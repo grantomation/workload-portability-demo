@@ -1,0 +1,3089 @@
+apiVersion: tekton.dev/v1
+kind: Task
+metadata:
+  name: check-image-exists
+  annotations:
+    description: "Verifies that a container image exists in the internal registry. Fails with a clear message if not found."
+spec:
+  params:
+    - name: image
+      type: string
+      description: "Image stream tag to check (e.g. golden-builder:latest)"
+    - name: namespace
+      type: string
+      default: "workload-portability-build"
+    - name: produced-by
+      type: string
+      description: "Which pipeline produces this image (shown in the error message)"
+  steps:
+    - name: check
+      image: image-registry.openshift-image-registry.svc:5000/openshift/cli:latest
+      script: |
+        #!/usr/bin/env bash
+        set -euo pipefail
+        IMAGE="$(params.image)"
+        NS="$(params.namespace)"
+        PRODUCER="$(params.produced-by)"
+
+        echo ">>> Checking dependency: ${IMAGE} in namespace ${NS}..."
+
+        if oc get imagestreamtag "${IMAGE}" -n "${NS}" > /dev/null 2>&1; then
+          echo ">>> OK: ${IMAGE} exists."
+        else
+          echo ""
+          echo "============================================================"
+          echo "  DEPENDENCY MISSING: ${IMAGE}"
+          echo ""
+          echo "  This image does not exist in the ${NS} namespace."
+          echo "  It is produced by: ${PRODUCER}"
+          echo ""
+          echo "  Run that pipeline first, then re-run this one."
+          echo "============================================================"
+          echo ""
+          exit 1
+        fi
+---
+apiVersion: tekton.dev/v1
+kind: Task
+metadata:
+  name: build-builder-image
+  annotations:
+    description: "Builds the golden-builder image (Fedora 44 + guestfs-tools + qemu-img) used by the build-golden-vm task"
+spec:
+  workspaces:
+    - name: source
+  params:
+    - name: image-registry
+      type: string
+      default: "image-registry.openshift-image-registry.svc:5000/workload-portability-build"
+  steps:
+    - name: build-and-push
+      image: registry.access.redhat.com/ubi9/buildah:latest
+      securityContext:
+        privileged: true
+      script: |
+        #!/usr/bin/env bash
+        set -euo pipefail
+        REGISTRY="$(params.image-registry)"
+        IMAGE="${REGISTRY}/golden-builder:latest"
+        echo ">>> Building golden-builder image..."
+        cd "$(workspaces.source.path)/01_installation_dashboard/pipelines/builder"
+        buildah bud --tls-verify=false -t "${IMAGE}" -f Containerfile .
+        echo ">>> Pushing to internal registry..."
+        buildah push --tls-verify=false "${IMAGE}"
+        echo ">>> Builder image pushed: ${IMAGE}"
+---
+apiVersion: tekton.dev/v1
+kind: Task
+metadata:
+  name: build-migration-components-image
+  annotations:
+    description: >-
+      Downloads the Migration Components tarball from the artifact server, builds a container
+      image containing the extracted libraries, pushes it to the internal
+      registry, and grants pull access so any namespace can use it.
+spec:
+  params:
+    - name: namespace
+      type: string
+      default: "workload-portability-build"
+    - name: image-registry
+      type: string
+      default: "image-registry.openshift-image-registry.svc:5000/workload-portability-build"
+  results:
+    - name: image-url
+      description: "Full image URL for the Migration Components init image"
+  volumes:
+    - name: artifacts-pvc
+      persistentVolumeClaim:
+        claimName: wp-artifacts
+  steps:
+    - name: build-and-push
+      image: registry.access.redhat.com/ubi9/buildah:latest
+      securityContext:
+        privileged: true
+      volumeMounts:
+        - name: artifacts-pvc
+          mountPath: /artifacts
+          readOnly: true
+      script: |
+        #!/usr/bin/env bash
+        set -euo pipefail
+        NS="$(params.namespace)"
+        REGISTRY="$(params.image-registry)"
+        IMAGE="${REGISTRY}/migration-components:latest"
+
+        echo "==================================================="
+        echo "  BUILD Migration Components IMAGE"
+        echo "==================================================="
+
+        # 1. Find the Migration Components tarball on the artifacts PVC
+        echo "[Migration Components] Looking for Migration Components tarball on artifacts PVC..."
+        ARCHIVE_COUNT=0
+        TARBALL=""
+        while IFS= read -r -d '' ARCHIVE; do
+            ARCHIVE_COUNT=$((ARCHIVE_COUNT + 1))
+            TARBALL="${ARCHIVE}"
+        done < <(find /artifacts -maxdepth 1 -name '*.tar.gz' -type f -print0)
+        if [ "${ARCHIVE_COUNT}" -eq 0 ]; then
+            echo "[FAIL] No *.tar.gz archive found. Upload one compatible component archive first."
+            exit 1
+        fi
+        if [ "${ARCHIVE_COUNT}" -ne 1 ]; then
+            echo "[FAIL] Multiple *.tar.gz archives found. Leave only the intended component archive before building."
+            exit 1
+        fi
+        echo "[Migration Components] Found: ${TARBALL} ($(du -h "${TARBALL}" | cut -f1))"
+
+        # 2. Preserve the complete archive tree in an isolated build payload.
+        # No supplier-specific directory names or archive layout are assumed.
+        BUILD_DIR=$(mktemp -d)
+        mkdir "${BUILD_DIR}/payload"
+        echo "[Migration Components] Extracting tarball..."
+        tar -xzf "${TARBALL}" -C "${BUILD_DIR}/payload" --no-same-owner --no-same-permissions
+        if [ -z "$(find "${BUILD_DIR}/payload" -mindepth 1 -print -quit)" ]; then
+            echo "[FAIL] Component archive is empty"
+            exit 1
+        fi
+
+        # 3. Copy all supplied files and directories into the runtime destination.
+        # The payload stays separate from this generated build recipe.
+        printf '%s\n' \
+          'FROM registry.access.redhat.com/ubi8/ubi-minimal' \
+          'COPY payload/ /migration-components/' \
+          'ENTRYPOINT ["cp", "-a", "/migration-components/.", "/opt/"]' \
+          > "${BUILD_DIR}/Containerfile"
+
+        # 4. Build
+        echo "[Migration Components] Building image..."
+        cd "${BUILD_DIR}"
+        buildah bud --tls-verify=false -t "${IMAGE}" -f Containerfile .
+
+        # 5. Push
+        echo "[Migration Components] Pushing to internal registry..."
+        buildah push --tls-verify=false "${IMAGE}"
+        echo "[Migration Components] Image pushed: ${IMAGE}"
+
+        # 6. Grant pull access to all authenticated users
+        echo "[Migration Components] Granting image pull access..."
+        printf '%s' "${IMAGE}" > "$(results.image-url.path)"
+
+        rm -rf "${BUILD_DIR}"
+        echo "[Migration Components] Done"
+    - name: grant-pull-access
+      image: image-registry.openshift-image-registry.svc:5000/openshift/cli:latest
+      script: |
+        #!/usr/bin/env bash
+        set -euo pipefail
+        NS="$(params.namespace)"
+        REGISTRY="$(params.image-registry)"
+        IMAGE="${REGISTRY}/migration-components:latest"
+        echo "[Migration Components] Granting image pull access to all service accounts..."
+        oc policy add-role-to-group system:image-puller system:serviceaccounts -n "${NS}" 2>/dev/null || true
+        oc policy add-role-to-group system:image-puller system:authenticated -n "${NS}" 2>/dev/null || true
+        echo "[Migration Components] Any namespace can now pull from ${NS}"
+
+        # Provider configuration is managed by the user through MTV.
+
+        echo ""
+        echo "==================================================="
+        echo "  Migration Components IMAGE READY"
+        echo "  ${IMAGE}"
+        echo "==================================================="
+    - name: restart-artifact-server
+      image: image-registry.openshift-image-registry.svc:5000/openshift/cli:latest
+      script: |
+        #!/usr/bin/env bash
+        set -euo pipefail
+        NS="$(params.namespace)"
+        # The buildah step mounts the artifacts PVC with privileged/no SELinux
+        # label, which uses Recursive relabeling and breaks the artifact server's
+        # MountOption-based access. Restarting forces a clean remount.
+        if oc get deployment artifacts -n "${NS}" &>/dev/null; then
+          echo "[Migration Components] Restarting artifact server to restore PVC access..."
+          oc rollout restart deployment/artifacts -n "${NS}"
+          oc rollout status deployment/artifacts -n "${NS}" --timeout=120s
+          echo "[Migration Components] Artifact server restarted."
+        else
+          echo "[Migration Components] No artifact server deployment — skipping restart."
+        fi
+---
+apiVersion: tekton.dev/v1
+kind: Task
+metadata:
+  name: fetch-management-ca
+  annotations:
+    description: >-
+      Best-effort: reads the Legacy Infra cluster from the dashboard secret, downloads
+      the management server CA certificate, and writes it to the artifacts PVC. If no Legacy Infra
+      cluster exists, the URL is wrong, or the download fails, the task logs a
+      warning and exits successfully — it never fails the pipeline.
+spec:
+  params:
+    - name: namespace
+      type: string
+      default: "workload-portability-build"
+    - name: clusters-secret
+      type: string
+      default: "installation-dashboard-clusters"
+  volumes:
+    - name: artifacts-pvc
+      persistentVolumeClaim:
+        claimName: wp-artifacts
+  steps:
+    - name: fetch
+      image: image-registry.openshift-image-registry.svc:5000/openshift/cli:latest
+      volumeMounts:
+        - name: artifacts-pvc
+          mountPath: /artifacts
+      script: |
+        #!/usr/bin/env bash
+        set -uo pipefail
+        NS="$(params.namespace)"
+        SECRET="$(params.clusters-secret)"
+        DEST="/artifacts/management-ca.crt"
+
+        echo "==================================================="
+        echo "  FETCH MANAGEMENT CA CERTIFICATE (best-effort)"
+        echo "==================================================="
+        echo ""
+
+        # 1. Read clusters secret
+        echo "[VCERT] Reading clusters from secret ${SECRET}..."
+        CLUSTERS_B64=$(oc get secret "${SECRET}" -n "${NS}" -o jsonpath='{.data.clusters}' 2>&1) || {
+            echo "[VCERT] SKIP: Could not read clusters secret: ${CLUSTERS_B64}"
+            echo "[VCERT] No Legacy Infra cluster configured — skipping"
+            exit 0
+        }
+
+        if [ -z "${CLUSTERS_B64}" ]; then
+            echo "[VCERT] SKIP: Clusters secret is empty"
+            exit 0
+        fi
+
+        # 2. Find Legacy Infra cluster and extract management server hostname
+        echo "[VCERT] Looking for Legacy Infra cluster..."
+        MANAGEMENT_URL=$(echo "${CLUSTERS_B64}" | base64 -d 2>/dev/null \
+            | python3 -c "import sys,json;[print(c['managementUrl']) for c in json.load(sys.stdin).values() if c.get('type')=='legacy' and c.get('managementUrl')]" 2>/dev/null | head -1)
+
+        if [ -z "${MANAGEMENT_URL}" ]; then
+            echo "[VCERT] SKIP: No Legacy Infra cluster found in dashboard config"
+            exit 0
+        fi
+        echo "[VCERT] Found management server URL: ${MANAGEMENT_URL}"
+
+        # 3. Extract hostname from URL
+        MANAGEMENT_HOST=$(echo "${MANAGEMENT_URL}" | sed -E 's|^https?://||' | cut -d'/' -f1 | cut -d':' -f1)
+        if [ -z "${MANAGEMENT_HOST}" ]; then
+            echo "[VCERT] SKIP: Could not extract hostname from URL"
+            exit 0
+        fi
+        echo "[VCERT] management server host: ${MANAGEMENT_HOST}"
+
+        # 4. Download certs bundle
+        CERT_URL="https://${MANAGEMENT_HOST}/certs/download.zip"
+        echo "[VCERT] Downloading ${CERT_URL}..."
+        TMPDIR=$(mktemp -d)
+        if ! curl -sk --max-time 30 -o "${TMPDIR}/download.zip" "${CERT_URL}" 2>&1; then
+            echo "[VCERT] SKIP: Could not download certs from ${CERT_URL}"
+            echo "[VCERT] management server may be unreachable or the URL may be wrong"
+            rm -rf "${TMPDIR}"
+            exit 0
+        fi
+
+        if [ ! -s "${TMPDIR}/download.zip" ]; then
+            echo "[VCERT] SKIP: Downloaded file is empty"
+            rm -rf "${TMPDIR}"
+            exit 0
+        fi
+        echo "[VCERT] Downloaded $(du -h "${TMPDIR}/download.zip" | cut -f1)"
+
+        # 5. Extract CA certificate
+        echo "[VCERT] Extracting certificates..."
+        if ! python3 -c "import zipfile,sys; zipfile.ZipFile(sys.argv[1]).extractall(sys.argv[2])" "${TMPDIR}/download.zip" "${TMPDIR}/certs" 2>&1; then
+            echo "[VCERT] SKIP: Could not unzip certificate bundle"
+            rm -rf "${TMPDIR}"
+            exit 0
+        fi
+
+        # Find ALL CA certs and concatenate them into one bundle
+        BUNDLE="${TMPDIR}/ca-bundle.pem"
+        : > "${BUNDLE}"
+        COUNT=0
+        for SEARCH in "${TMPDIR}/certs/certs/lin/"*.0 "${TMPDIR}/certs/certs/lin/"*.crt "${TMPDIR}/certs/"*.0 "${TMPDIR}/certs/"*.crt; do
+            if [ -f "${SEARCH}" ] 2>/dev/null; then
+                if openssl x509 -in "${SEARCH}" -noout -subject 2>/dev/null; then
+                    SUBJECT=$(openssl x509 -in "${SEARCH}" -noout -subject 2>/dev/null)
+                    EXPIRY=$(openssl x509 -in "${SEARCH}" -noout -enddate 2>/dev/null)
+                    echo "[VCERT] Found: $(basename "${SEARCH}") — ${SUBJECT}"
+                    echo "[VCERT]   ${EXPIRY}"
+                    cat "${SEARCH}" >> "${BUNDLE}"
+                    COUNT=$((COUNT + 1))
+                fi
+            fi
+        done
+
+        if [ "${COUNT}" -eq 0 ]; then
+            echo "[VCERT] SKIP: Could not find any CA certificates in downloaded bundle"
+            echo "[VCERT] Contents:"
+            find "${TMPDIR}/certs" -type f 2>/dev/null | head -20 | sed 's/^/  /'
+            rm -rf "${TMPDIR}"
+            exit 0
+        fi
+        echo "[VCERT] Found ${COUNT} CA certificate(s)"
+
+        # 7. Copy bundle to artifacts PVC
+        cp "${BUNDLE}" "${DEST}"
+        echo "[VCERT] Written to ${DEST} ($(du -h "${DEST}" | cut -f1))"
+
+        rm -rf "${TMPDIR}"
+        echo ""
+        echo "[VCERT] Done — management server CA certificate is available on the artifacts PVC"
+---
+apiVersion: tekton.dev/v1
+kind: Task
+metadata:
+  name: build-artifact-server
+  annotations:
+    description: "Builds the artifact server container image (Node.js file server with upload support)"
+spec:
+  workspaces:
+    - name: source
+  params:
+    - name: image-registry
+      type: string
+      default: "image-registry.openshift-image-registry.svc:5000/workload-portability-build"
+  steps:
+    - name: build-and-push
+      image: registry.access.redhat.com/ubi9/buildah:latest
+      securityContext:
+        privileged: true
+      script: |
+        #!/usr/bin/env bash
+        set -euo pipefail
+        REGISTRY="$(params.image-registry)"
+        IMAGE="${REGISTRY}/artifact-server:latest"
+        echo ">>> Building artifact server image..."
+        cd "$(workspaces.source.path)/03_artifact_server"
+        buildah bud --tls-verify=false -t "${IMAGE}" -f Containerfile .
+        echo ">>> Pushing to internal registry..."
+        buildah push --tls-verify=false "${IMAGE}"
+        echo ">>> Artifact server image pushed: ${IMAGE}"
+---
+apiVersion: tekton.dev/v1
+kind: Task
+metadata:
+  name: build-wp-app
+  annotations:
+    description: "Runs npm install for the portable-workload app. Prepares node_modules in the workspace for embedding into the golden VM."
+spec:
+  workspaces:
+    - name: source
+  steps:
+    - name: npm-install
+      image: registry.access.redhat.com/ubi9/nodejs-22:latest
+      workingDir: $(workspaces.source.path)/02_workload
+      script: |
+        #!/bin/sh
+        set -e
+        echo ">>> Installing portable-workload dependencies..."
+        npm install --omit=dev
+        echo ">>> App build complete. node_modules ready."
+        ls -la node_modules/ | head -5
+---
+apiVersion: tekton.dev/v1
+kind: Task
+metadata:
+  name: build-vm
+  annotations:
+    description: "Builds a purpose-built Alpine VM (frontend or backend) for the Portable Workload app. Outputs qcow2 + VMDK to the artifacts workspace."
+spec:
+  workspaces:
+    - name: source
+    - name: artifacts
+  params:
+    - name: role
+      type: string
+      description: "VM role: 'frontend' or 'backend'"
+    - name: alpine-rel
+      type: string
+      default: "3.21.2"
+  stepTemplate:
+    securityContext:
+      privileged: true
+    computeResources:
+      requests:
+        memory: 4Gi
+        cpu: "2"
+      limits:
+        memory: 4Gi
+  steps:
+    - name: build-vm
+      image: image-registry.openshift-image-registry.svc:5000/workload-portability-build/golden-builder:latest
+      timeout: 15m
+      env:
+        - name: VM_ROLE
+          value: "$(params.role)"
+      script: |
+        #!/usr/bin/env bash
+        set -euo pipefail
+        export ALPINE_REL="$(params.alpine-rel)"
+        export REPO_SRC="$(workspaces.source.path)"
+        export APP_SRC="$(workspaces.source.path)/02_workload"
+        export OUTPUT_DIR="$(workspaces.artifacts.path)"
+        exec $(workspaces.source.path)/01_installation_dashboard/pipelines/scripts/build-vm.sh
+---
+apiVersion: tekton.dev/v1
+kind: Task
+metadata:
+  name: build-loadbalancer
+  annotations:
+    description: "Builds the faux-loadbalancer container image (Node.js reverse proxy + dashboard) and pushes to the internal registry"
+spec:
+  workspaces:
+    - name: source
+  params:
+    - name: image-registry
+      type: string
+      default: "image-registry.openshift-image-registry.svc:5000/workload-portability-build"
+    - name: image-tag
+      type: string
+      default: "latest"
+  steps:
+    - name: build-and-push
+      image: registry.access.redhat.com/ubi9/buildah:latest
+      securityContext:
+        privileged: true
+      script: |
+        #!/usr/bin/env bash
+        set -euo pipefail
+        TAG="$(params.image-tag)"
+        REGISTRY="$(params.image-registry)"
+        IMAGE="${REGISTRY}/faux-loadbalancer:${TAG}"
+        IMAGE_LATEST="${REGISTRY}/faux-loadbalancer:latest"
+        echo ">>> Building loadbalancer image..."
+        cd "$(workspaces.source.path)/04_loadbalancer_app"
+        buildah bud --tls-verify=false -t "${IMAGE}" -f Containerfile .
+        buildah tag "${IMAGE}" "${IMAGE_LATEST}"
+        echo ">>> Pushing to internal registry..."
+        buildah push --tls-verify=false "${IMAGE}"
+        buildah push --tls-verify=false "${IMAGE_LATEST}"
+        echo ">>> Loadbalancer image pushed: ${IMAGE}"
+---
+apiVersion: tekton.dev/v1
+kind: Task
+metadata:
+  name: check-artifacts-exist
+  annotations:
+    description: "Verifies that arch VM disk images exist on the artifacts PVC. Fails with a clear message if pipeline 3 hasn't run."
+spec:
+  workspaces:
+    - name: artifacts
+  steps:
+    - name: check
+      image: image-registry.openshift-image-registry.svc:5000/openshift/cli:latest
+      script: |
+        #!/usr/bin/env bash
+        set -euo pipefail
+        ARTIFACTS="$(workspaces.artifacts.path)"
+
+        echo ">>> Checking for arch VM disk images on artifacts PVC..."
+
+        MISSING=()
+        for f in pw_backend.qcow2 pw_backend.vmdk pw_frontend.qcow2 pw_frontend.vmdk; do
+          if [ -f "${ARTIFACTS}/${f}" ]; then
+            SIZE=$(du -h "${ARTIFACTS}/${f}" | cut -f1)
+            echo ">>> OK: ${f} (${SIZE})"
+          else
+            MISSING+=("${f}")
+          fi
+        done
+
+        if [ ${#MISSING[@]} -gt 0 ]; then
+          echo ""
+          echo "============================================================"
+          echo "  DEPENDENCY MISSING: arch VM disk images"
+          echo ""
+          echo "  The following files were not found on the artifacts PVC:"
+          for f in "${MISSING[@]}"; do
+            echo "    - ${f}"
+          done
+          echo ""
+          echo "  These are produced by: pipeline 3 (3-build-arch-vm)"
+          echo ""
+          echo "  Run that pipeline first, then re-run this one."
+          echo "============================================================"
+          echo ""
+          exit 1
+        fi
+
+        echo ">>> All artifacts present."
+---
+apiVersion: tekton.dev/v1
+kind: Task
+metadata:
+  name: ensure-artifacts-pvc
+  annotations:
+    description: >-
+      Creates the wp-artifacts PVC if it doesn't exist, and scales down
+      the artifact server deployment (if running) so the PVC is free for the
+      copy step. This makes PVC lifecycle visible in the pipeline UI.
+spec:
+  params:
+    - name: namespace
+      type: string
+      default: "workload-portability-build"
+  steps:
+    - name: ensure
+      image: image-registry.openshift-image-registry.svc:5000/openshift/cli:latest
+      script: |
+        #!/usr/bin/env bash
+        set -euo pipefail
+        NS="$(params.namespace)"
+
+        echo "==================================================="
+        echo "  ENSURE ARTIFACTS PVC"
+        echo "==================================================="
+        echo ""
+
+        if oc get pvc wp-artifacts -n "${NS}" &>/dev/null; then
+          echo "  PVC already exists:"
+          oc get pvc wp-artifacts -n "${NS}" -o wide | sed 's/^/    /'
+        else
+          echo "  Creating wp-artifacts PVC (2Gi, RWO)..."
+          cat <<'YAML' | oc apply -n "${NS}" -f -
+        apiVersion: v1
+        kind: PersistentVolumeClaim
+        metadata:
+          name: wp-artifacts
+        spec:
+          accessModes:
+            - ReadWriteOnce
+          resources:
+            requests:
+              storage: 2Gi
+        YAML
+          echo "  PVC created."
+        fi
+
+        echo ""
+
+        if oc get deployment artifacts -n "${NS}" &>/dev/null; then
+          REPLICAS=$(oc get deployment artifacts -n "${NS}" -o jsonpath='{.spec.replicas}')
+          if [ "${REPLICAS}" != "0" ]; then
+            echo "  Scaling down artifact server to free PVC..."
+            oc scale deployment artifacts -n "${NS}" --replicas=0
+            oc rollout status deployment/artifacts -n "${NS}" --timeout=60s
+            echo "  Artifact server scaled down."
+          else
+            echo "  Artifact server already scaled to 0."
+          fi
+        else
+          echo "  No existing artifact server deployment (first run)."
+        fi
+
+        echo ""
+        echo "  PVC status:"
+        oc get pvc wp-artifacts -n "${NS}" -o wide | sed 's/^/    /'
+        echo ""
+        echo "  PVC is ready for the copy step."
+---
+apiVersion: tekton.dev/v1
+kind: Task
+metadata:
+  name: copy-artifacts
+  annotations:
+    description: >-
+      Copies VM disk images from the build workspace to the wp-artifacts
+      PVC. The artifacts PVC is mounted directly (not via a workspace) so the
+      pipeline doesn't need it as a pre-existing workspace binding.
+spec:
+  workspaces:
+    - name: source
+      description: "Build workspace (artifacts/ subfolder with qcow2 + vmdk files)"
+  volumes:
+    - name: artifacts-pvc
+      persistentVolumeClaim:
+        claimName: wp-artifacts
+  steps:
+    - name: copy
+      image: alpine:3.21
+      volumeMounts:
+        - name: artifacts-pvc
+          mountPath: /artifacts
+      script: |
+        #!/bin/sh
+        set -euo pipefail
+        SRC="$(workspaces.source.path)"
+        DST="/artifacts"
+
+        echo "==================================================="
+        echo "  COPY VM ARTIFACTS"
+        echo "==================================================="
+        echo ""
+        echo "  Source: build workspace (artifacts/)"
+        echo "  Dest:   wp-artifacts PVC"
+        echo ""
+
+        COPIED=0; SKIPPED=0; FAIL=0
+
+        for FILE in pw_backend.qcow2 pw_backend.vmdk pw_frontend.qcow2 pw_frontend.vmdk; do
+          if [ ! -f "${SRC}/${FILE}" ]; then
+            echo "  MISSING: ${FILE}"
+            FAIL=$((FAIL + 1))
+            continue
+          fi
+
+          SIZE=$(du -h "${SRC}/${FILE}" | cut -f1)
+          SRC_SHA=$(sha256sum "${SRC}/${FILE}" | cut -d' ' -f1)
+
+          if [ -f "${DST}/${FILE}" ]; then
+            DST_SHA=$(sha256sum "${DST}/${FILE}" | cut -d' ' -f1)
+            if [ "${SRC_SHA}" = "${DST_SHA}" ]; then
+              echo "  SKIP ${FILE} (${SIZE}) — already up to date"
+              SKIPPED=$((SKIPPED + 1))
+              continue
+            fi
+          fi
+
+          echo -n "  Copying ${FILE} (${SIZE})... "
+          cp "${SRC}/${FILE}" "${DST}/${FILE}"
+          echo "done"
+          COPIED=$((COPIED + 1))
+        done
+
+        echo ""
+        echo "  Copied: ${COPIED}/4  Skipped: ${SKIPPED}/4  Missing: ${FAIL}/4"
+        echo ""
+        echo "  Dest contents:"
+        ls -lh "${DST}"/*.qcow2 "${DST}"/*.vmdk 2>/dev/null | sed 's/^/    /'
+        echo ""
+
+        [ "${FAIL}" -eq 0 ] || { echo "ERROR: missing artifacts" >&2; exit 1; }
+---
+apiVersion: tekton.dev/v1
+kind: Task
+metadata:
+  name: deploy-artifact-server
+  annotations:
+    description: >-
+      Deploys the artifact server (Node.js) behind an OpenShift OAuth proxy.
+      Serves VM disk images and Legacy Infra assets from the wp-artifacts PVC.
+      Supports file upload, download, and deletion via the web UI.
+      Users authenticate via OpenShift OAuth.
+spec:
+  params:
+    - name: namespace
+      type: string
+      default: "workload-portability-build"
+    - name: image
+      type: string
+      default: "image-registry.openshift-image-registry.svc:5000/workload-portability-build/artifact-server:latest"
+  steps:
+    - name: deploy
+      image: image-registry.openshift-image-registry.svc:5000/openshift/cli:latest
+      script: |
+        #!/usr/bin/env bash
+        set -euo pipefail
+        NS="$(params.namespace)"
+        IMAGE="$(params.image)"
+
+        echo ">>> Deploying artifact server with OAuth proxy..."
+
+        # Get namespace security settings for PVC permissions
+        FS_GROUP=$(oc get namespace "${NS}" -o jsonpath='{.metadata.annotations.openshift\.io/sa\.scc\.supplemental-groups}' | cut -d/ -f1)
+        MCS_LEVEL=$(oc get namespace "${NS}" -o jsonpath='{.metadata.annotations.openshift\.io/sa\.scc\.mcs}')
+        echo ">>> Namespace fsGroup: ${FS_GROUP}"
+        echo ">>> Namespace MCS level: ${MCS_LEVEL}"
+
+        # Clean up old golden-artifacts and httpd-based resources
+        for KIND in deployment service route; do
+          oc delete "${KIND}" golden-artifacts -n "${NS}" --ignore-not-found=true 2>/dev/null || true
+        done
+        oc delete configmap artifacts-httpd-config -n "${NS}" --ignore-not-found=true 2>/dev/null || true
+
+        # 1. ServiceAccount with OAuth redirect annotation
+        echo ">>> Creating ServiceAccount..."
+        cat <<'YAML' | oc apply -n "${NS}" -f -
+        apiVersion: v1
+        kind: ServiceAccount
+        metadata:
+          name: artifacts
+          annotations:
+            serviceaccounts.openshift.io/oauth-redirectreference.primary: '{"kind":"OAuthRedirectReference","apiVersion":"v1","reference":{"kind":"Route","name":"artifacts"}}'
+        YAML
+
+        # 2. Cookie session secret (only created on first run)
+        if ! oc get secret artifacts-proxy -n "${NS}" &>/dev/null; then
+          echo ">>> Creating OAuth proxy cookie secret..."
+          SESSION=$(openssl rand -base64 32)
+          oc create secret generic artifacts-proxy \
+            --from-literal=session_secret="${SESSION}" \
+            -n "${NS}"
+        else
+          echo ">>> OAuth proxy cookie secret already exists."
+        fi
+
+        # 3. Service (triggers auto-generation of TLS serving cert)
+        echo ">>> Creating Service..."
+        cat <<'YAML' | oc apply -n "${NS}" -f -
+        apiVersion: v1
+        kind: Service
+        metadata:
+          name: artifacts
+          annotations:
+            service.beta.openshift.io/serving-cert-secret-name: artifacts-tls
+        spec:
+          selector:
+            app: artifacts
+          ports:
+            - name: proxy
+              port: 8443
+              targetPort: 8443
+        YAML
+
+        # 4. Deployment with artifact server + OAuth proxy sidecar
+        echo ">>> Creating Deployment..."
+        cat <<YAML | oc apply -n "${NS}" -f -
+        apiVersion: apps/v1
+        kind: Deployment
+        metadata:
+          name: artifacts
+          labels:
+            app: artifacts
+        spec:
+          replicas: 1
+          selector:
+            matchLabels:
+              app: artifacts
+          template:
+            metadata:
+              labels:
+                app: artifacts
+            spec:
+              serviceAccountName: artifacts
+              securityContext:
+                fsGroup: ${FS_GROUP}
+                seLinuxOptions:
+                  level: ${MCS_LEVEL}
+              containers:
+                - name: server
+                  image: ${IMAGE}
+                  env:
+                    - name: PORT
+                      value: "8080"
+                    - name: FILES_DIR
+                      value: /var/www/files
+                  ports:
+                    - containerPort: 8080
+                  volumeMounts:
+                    - name: artifacts
+                      mountPath: /var/www/files
+                  readinessProbe:
+                    httpGet:
+                      path: /api/files
+                      port: 8080
+                    initialDelaySeconds: 3
+                    periodSeconds: 10
+                - name: oauth-proxy
+                  image: registry.redhat.io/openshift4/ose-oauth-proxy:v4.14
+                  args:
+                    - --https-address=:8443
+                    - --provider=openshift
+                    - --openshift-service-account=artifacts
+                    - --upstream=http://localhost:8080
+                    - --tls-cert=/etc/tls/private/tls.crt
+                    - --tls-key=/etc/tls/private/tls.key
+                    - --cookie-secret-file=/etc/proxy/secrets/session_secret
+                    - --cookie-refresh=0
+                    - --upstream-timeout=600s
+                  ports:
+                    - containerPort: 8443
+                      name: proxy
+                  volumeMounts:
+                    - name: proxy-tls
+                      mountPath: /etc/tls/private
+                      readOnly: true
+                    - name: proxy-secret
+                      mountPath: /etc/proxy/secrets
+                      readOnly: true
+              volumes:
+                - name: artifacts
+                  persistentVolumeClaim:
+                    claimName: wp-artifacts
+                - name: proxy-tls
+                  secret:
+                    secretName: artifacts-tls
+                - name: proxy-secret
+                  secret:
+                    secretName: artifacts-proxy
+        YAML
+
+        # 5. Route with reencrypt TLS
+        echo ">>> Creating Route..."
+        cat <<'YAML' | oc apply -n "${NS}" -f -
+        apiVersion: route.openshift.io/v1
+        kind: Route
+        metadata:
+          name: artifacts
+          annotations:
+            haproxy.router.openshift.io/proxy-body-size: "2g"
+            haproxy.router.openshift.io/timeout: "600s"
+        spec:
+          to:
+            kind: Service
+            name: artifacts
+          port:
+            targetPort: proxy
+          tls:
+            termination: reencrypt
+            insecureEdgeTerminationPolicy: Redirect
+        YAML
+
+        echo ">>> Waiting for deployment rollout..."
+        oc rollout status deployment/artifacts -n "${NS}" --timeout=120s
+
+        ROUTE=$(oc get route artifacts -n "${NS}" -o jsonpath='{.spec.host}' 2>/dev/null || echo "pending")
+        echo ""
+        echo "=== Artifact server deployed ==="
+        echo "Route: https://${ROUTE}"
+        echo ""
+        echo "Upload and download artifacts at:"
+        echo "  https://${ROUTE}/"
+        echo ""
+        echo "(Requires OpenShift login — you will be redirected to authenticate)"
+---
+apiVersion: tekton.dev/v1
+kind: Task
+metadata:
+  name: check-artifact-server
+  annotations:
+    description: >-
+      Checks whether the artifact server deployment exists. Outputs a result
+      used by refresh-artifact-server's when clause to decide whether to
+      update the running server with fresh VM images.
+spec:
+  params:
+    - name: namespace
+      type: string
+      default: "workload-portability-build"
+  results:
+    - name: exists
+      description: "'yes' if the artifacts deployment exists, 'no' otherwise"
+  steps:
+    - name: check
+      image: image-registry.openshift-image-registry.svc:5000/openshift/cli:latest
+      script: |
+        #!/usr/bin/env bash
+        set -euo pipefail
+        NS="$(params.namespace)"
+
+        if oc get deployment artifacts -n "${NS}" &>/dev/null; then
+          echo ">>> Artifact server deployment found — will refresh with new images."
+          echo -n "yes" > "$(results.exists.path)"
+        else
+          echo ">>> No artifact server deployment found — nothing to refresh."
+          echo ">>> Run pipeline 6 to deploy the artifact server for the first time."
+          echo -n "no" > "$(results.exists.path)"
+        fi
+---
+apiVersion: tekton.dev/v1
+kind: Task
+metadata:
+  name: refresh-artifact-server
+  annotations:
+    description: >-
+      Refreshes the running artifact server with new VM images. Scales down
+      the deployment to free the PVC, copies fresh images from the build
+      workspace, then scales back up. Only runs when the artifact server
+      is already deployed (guarded by a when clause in the pipeline).
+spec:
+  params:
+    - name: namespace
+      type: string
+      default: "workload-portability-build"
+  workspaces:
+    - name: source
+      description: "Build workspace (artifacts/ subfolder with qcow2 + vmdk files)"
+  volumes:
+    - name: artifacts-pvc
+      persistentVolumeClaim:
+        claimName: wp-artifacts
+  steps:
+    - name: refresh
+      image: image-registry.openshift-image-registry.svc:5000/openshift/cli:latest
+      volumeMounts:
+        - name: artifacts-pvc
+          mountPath: /artifacts
+      script: |
+        #!/usr/bin/env bash
+        set -euo pipefail
+        NS="$(params.namespace)"
+        SRC="$(workspaces.source.path)"
+        DST="/artifacts"
+
+        echo "==================================================="
+        echo "  REFRESH ARTIFACT SERVER"
+        echo "==================================================="
+        echo ""
+
+        echo ">>> Scaling down artifact server to free PVC..."
+        oc scale deployment artifacts -n "${NS}" --replicas=0
+        oc rollout status deployment/artifacts -n "${NS}" --timeout=60s
+        echo ""
+
+        PASS=0; FAIL=0
+        for FILE in pw_backend.qcow2 pw_backend.vmdk pw_frontend.qcow2 pw_frontend.vmdk; do
+          if [ -f "${SRC}/${FILE}" ]; then
+            SIZE=$(du -h "${SRC}/${FILE}" | cut -f1)
+            echo -n "  Copying ${FILE} (${SIZE})... "
+            cp "${SRC}/${FILE}" "${DST}/${FILE}"
+            echo "done"
+            PASS=$((PASS + 1))
+          else
+            echo "  MISSING: ${SRC}/${FILE}"
+            FAIL=$((FAIL + 1))
+          fi
+        done
+
+        echo ""
+        echo "  Copied: ${PASS}/4 files"
+
+        if [ "${FAIL}" -gt 0 ]; then
+          echo "  WARNING: ${FAIL} file(s) missing — scaling server back up with partial update."
+        fi
+
+        echo ""
+        echo ">>> Scaling artifact server back up..."
+        oc scale deployment artifacts -n "${NS}" --replicas=1
+        oc rollout status deployment/artifacts -n "${NS}" --timeout=120s
+
+        ROUTE=$(oc get route artifacts -n "${NS}" -o jsonpath='{.spec.host}' 2>/dev/null || echo "pending")
+        echo ""
+        echo "  Artifact server refreshed: https://${ROUTE}"
+---
+apiVersion: tekton.dev/v1
+kind: Task
+metadata:
+  name: verify-artifact-server
+  annotations:
+    description: >-
+      Verifies the artifact server is running and all 4 VM disk images are
+      present. Checks deployment health, route status, and file existence
+      on the PVC (OAuth prevents unauthenticated curl).
+spec:
+  params:
+    - name: namespace
+      type: string
+      default: "workload-portability-build"
+  steps:
+    - name: verify
+      image: image-registry.openshift-image-registry.svc:5000/openshift/cli:latest
+      script: |
+        #!/usr/bin/env bash
+        set -euo pipefail
+        NS="$(params.namespace)"
+
+        echo "==================================================="
+        echo "  VERIFY ARTIFACT SERVER"
+        echo "==================================================="
+        echo ""
+
+        PASS=0; FAIL=0
+
+        # 1. Deployment has ready pods
+        READY=$(oc get deployment artifacts -n "${NS}" -o jsonpath='{.status.readyReplicas}' 2>/dev/null || echo "0")
+        if [ "${READY:-0}" -ge 1 ]; then
+          echo "  OK  Deployment ready (${READY} replica(s))"
+          PASS=$((PASS + 1))
+        else
+          echo "  FAIL Deployment not ready (${READY:-0} replicas)"
+          FAIL=$((FAIL + 1))
+        fi
+
+        # 2. Route exists and is admitted
+        ROUTE=$(oc get route artifacts -n "${NS}" -o jsonpath='{.spec.host}' 2>/dev/null || echo "")
+        if [ -n "${ROUTE}" ]; then
+          echo "  OK  Route admitted: https://${ROUTE}"
+          PASS=$((PASS + 1))
+        else
+          echo "  FAIL Route not found or not admitted"
+          FAIL=$((FAIL + 1))
+        fi
+
+        # 3. OAuth proxy responds (302 redirect to login = working)
+        if [ -n "${ROUTE}" ]; then
+          HTTP_CODE=$(curl -sk -o /dev/null -w '%{http_code}' --max-time 10 "https://${ROUTE}/" || echo "000")
+          if [ "${HTTP_CODE}" = "302" ] || [ "${HTTP_CODE}" = "403" ] || [ "${HTTP_CODE}" = "200" ]; then
+            echo "  OK  OAuth proxy responding (HTTP ${HTTP_CODE})"
+            PASS=$((PASS + 1))
+          else
+            echo "  FAIL OAuth proxy not responding (HTTP ${HTTP_CODE})"
+            FAIL=$((FAIL + 1))
+          fi
+        fi
+
+        # 4. Files visible via the server API (proves the app can actually read the PVC)
+        POD=$(oc get pods -n "${NS}" -l app=artifacts -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || echo "")
+        if [ -n "${POD}" ]; then
+          echo ""
+          echo "  Files via API:"
+          API_RESP=$(oc exec "${POD}" -c server -n "${NS}" -- wget -qO- http://localhost:8080/api/files 2>/dev/null || echo '{"files":[]}')
+          for FILE in pw_backend.qcow2 pw_backend.vmdk pw_frontend.qcow2 pw_frontend.vmdk; do
+            if echo "${API_RESP}" | grep -q "\"${FILE}\""; then
+              SIZE=$(echo "${API_RESP}" | grep -o "\"name\":\"${FILE}\"[^}]*\"sizeHuman\":\"[^\"]*\"" | grep -o '"sizeHuman":"[^"]*"' | cut -d'"' -f4)
+              echo "    OK  ${FILE} (${SIZE})"
+              PASS=$((PASS + 1))
+            else
+              echo "    FAIL ${FILE} — not visible to server (SELinux or permissions)"
+              FAIL=$((FAIL + 1))
+            fi
+          done
+        fi
+
+        echo ""
+        echo "  Result: ${PASS} passed, ${FAIL} failed"
+        echo ""
+
+        if [ "${FAIL}" -gt 0 ]; then
+          echo "  ERROR: ${FAIL} check(s) failed."
+          exit 1
+        fi
+
+        echo "  Artifact server verified."
+        echo "  Browse: https://${ROUTE}/"
+        echo "  (Requires OpenShift login)"
+---
+apiVersion: tekton.dev/v1
+kind: Task
+metadata:
+  name: package-vm-containerdisk
+  annotations:
+    description: "Wraps a VM qcow2 disk image into a container image (containerDisk format) and pushes to the internal registry."
+spec:
+  workspaces:
+    - name: artifacts
+  params:
+    - name: role
+      type: string
+      description: "VM role name (frontend or backend) — matches the qcow2 filename"
+    - name: image-registry
+      type: string
+      default: "image-registry.openshift-image-registry.svc:5000/workload-portability-build"
+  steps:
+    - name: package
+      image: registry.access.redhat.com/ubi9/buildah:latest
+      securityContext:
+        privileged: true
+      script: |
+        #!/usr/bin/env bash
+        set -euo pipefail
+        ROLE="$(params.role)"
+        REGISTRY="$(params.image-registry)"
+        ARTIFACTS="$(workspaces.artifacts.path)"
+        QCOW="${ARTIFACTS}/pw_${ROLE}.qcow2"
+        IMAGE="${REGISTRY}/pw-${ROLE}-vm:latest"
+
+        if [ ! -f "${QCOW}" ]; then
+          echo "ERROR: ${QCOW} not found" >&2
+          exit 1
+        fi
+
+        SIZE=$(du -h "${QCOW}" | cut -f1)
+        echo ">>> Packaging ${QCOW} (${SIZE}) as containerDisk..."
+
+        WORKDIR=$(mktemp -d)
+        cat > "${WORKDIR}/Containerfile" <<EOF
+        FROM scratch
+        ADD pw_${ROLE}.qcow2 /disk/
+        EOF
+        cp "${QCOW}" "${WORKDIR}/"
+
+        buildah bud --tls-verify=false -t "${IMAGE}" -f "${WORKDIR}/Containerfile" "${WORKDIR}"
+        buildah push --tls-verify=false "${IMAGE}"
+        echo ">>> Pushed: ${IMAGE}"
+        rm -rf "${WORKDIR}"
+---
+apiVersion: tekton.dev/v1
+kind: Task
+metadata:
+  name: deploy-test-vms
+  annotations:
+    description: "Deploys backend + frontend VMs on OpenShift Virt with Services and a Route for smoke testing."
+spec:
+  params:
+    - name: namespace
+      type: string
+      default: "workload-portability-build"
+    - name: image-registry
+      type: string
+      default: "image-registry.openshift-image-registry.svc:5000/workload-portability-build"
+  results:
+    - name: route-host
+      description: "Frontend route hostname"
+  steps:
+    - name: deploy
+      image: image-registry.openshift-image-registry.svc:5000/openshift/cli:latest
+      script: |
+        #!/usr/bin/env bash
+        set -euo pipefail
+        NS="$(params.namespace)"
+        REGISTRY="$(params.image-registry)"
+
+        echo ">>> Deploying backend VM..."
+        cat <<YAML | oc apply -n "${NS}" -f -
+        apiVersion: kubevirt.io/v1
+        kind: VirtualMachine
+        metadata:
+          name: pw-backend-test
+          labels:
+            app: pw-backend
+            app.kubernetes.io/part-of: pw-smoke-test
+        spec:
+          running: true
+          template:
+            metadata:
+              labels:
+                app: pw-backend
+                app.kubernetes.io/part-of: pw-smoke-test
+            spec:
+              domain:
+                firmware:
+                  bootloader:
+                    efi:
+                      secureBoot: false
+                resources:
+                  requests:
+                    memory: 512Mi
+                devices:
+                  disks:
+                    - name: rootdisk
+                      disk:
+                        bus: virtio
+                  interfaces:
+                    - name: default
+                      masquerade: {}
+              networks:
+                - name: default
+                  pod: {}
+              volumes:
+                - name: rootdisk
+                  containerDisk:
+                    image: ${REGISTRY}/pw-backend-vm:latest
+        YAML
+
+        echo ">>> Creating backend Service..."
+        cat <<YAML | oc apply -n "${NS}" -f -
+        apiVersion: v1
+        kind: Service
+        metadata:
+          name: pw-backend-svc
+          labels:
+            app.kubernetes.io/part-of: pw-smoke-test
+        spec:
+          selector:
+            app: pw-backend
+          ports:
+            - name: postgres
+              port: 5432
+              targetPort: 5432
+            - name: ssh
+              port: 22
+              targetPort: 22
+        YAML
+
+        echo ">>> Deploying frontend VM..."
+        cat <<YAML | oc apply -n "${NS}" -f -
+        apiVersion: kubevirt.io/v1
+        kind: VirtualMachine
+        metadata:
+          name: pw-frontend-test
+          labels:
+            app: pw-frontend
+            app.kubernetes.io/part-of: pw-smoke-test
+        spec:
+          running: true
+          template:
+            metadata:
+              labels:
+                app: pw-frontend
+                app.kubernetes.io/part-of: pw-smoke-test
+            spec:
+              domain:
+                firmware:
+                  bootloader:
+                    efi:
+                      secureBoot: false
+                resources:
+                  requests:
+                    memory: 512Mi
+                devices:
+                  disks:
+                    - name: rootdisk
+                      disk:
+                        bus: virtio
+                  interfaces:
+                    - name: default
+                      masquerade: {}
+              networks:
+                - name: default
+                  pod: {}
+              volumes:
+                - name: rootdisk
+                  containerDisk:
+                    image: ${REGISTRY}/pw-frontend-vm:latest
+        YAML
+
+        echo ">>> Creating frontend Service + Route..."
+        cat <<YAML | oc apply -n "${NS}" -f -
+        apiVersion: v1
+        kind: Service
+        metadata:
+          name: pw-frontend-svc
+          labels:
+            app.kubernetes.io/part-of: pw-smoke-test
+        spec:
+          selector:
+            app: pw-frontend
+          ports:
+            - name: http
+              port: 80
+              targetPort: 80
+            - name: ssh
+              port: 22
+              targetPort: 22
+        YAML
+
+        cat <<YAML | oc apply -n "${NS}" -f -
+        apiVersion: route.openshift.io/v1
+        kind: Route
+        metadata:
+          name: pw-smoke-test
+          labels:
+            app.kubernetes.io/part-of: pw-smoke-test
+        spec:
+          to:
+            kind: Service
+            name: pw-frontend-svc
+          port:
+            targetPort: 80
+          tls:
+            termination: edge
+            insecureEdgeTerminationPolicy: Redirect
+        YAML
+
+        echo ">>> Waiting for VMs to start..."
+        oc wait --for=condition=Ready vmi/pw-backend-test -n "${NS}" --timeout=300s || true
+        oc wait --for=condition=Ready vmi/pw-frontend-test -n "${NS}" --timeout=300s || true
+
+        ROUTE_HOST=$(oc get route pw-smoke-test -n "${NS}" -o jsonpath='{.spec.host}')
+        echo ">>> Frontend route: https://${ROUTE_HOST}"
+        printf "%s" "${ROUTE_HOST}" > "$(results.route-host.path)"
+---
+apiVersion: tekton.dev/v1
+kind: Task
+metadata:
+  name: test-ocp-service-dns
+  annotations:
+    description: "Verifies K8s Service DNS resolution and that the frontend app connected to the backend via CoreDNS."
+spec:
+  params:
+    - name: route-host
+      type: string
+      description: "Frontend route hostname (from deploy-test-vms)"
+    - name: namespace
+      type: string
+      default: "workload-portability-build"
+  steps:
+    - name: test
+      image: image-registry.openshift-image-registry.svc:5000/openshift/cli:latest
+      timeout: 5m
+      script: |
+        #!/usr/bin/env bash
+        set -euo pipefail
+        NS="$(params.namespace)"
+        ROUTE="https://$(params.route-host)"
+        PASS=0; FAIL=0; RESULTS=""
+
+        run_check() {
+          local desc="$1"; shift
+          echo -n "  CHECK: ${desc} ... "
+          if "$@" >/dev/null 2>&1; then
+            echo "PASS"; PASS=$((PASS + 1))
+            RESULTS="${RESULTS}  PASS  ${desc}\n"
+          else
+            echo "FAIL"; FAIL=$((FAIL + 1))
+            RESULTS="${RESULTS}  FAIL  ${desc}\n"
+          fi
+        }
+
+        check_contains() {
+          local desc="$1" value="$2" pattern="$3"
+          echo -n "  CHECK: ${desc} ... "
+          if echo "${value}" | grep -q "${pattern}" 2>/dev/null; then
+            echo "PASS"; PASS=$((PASS + 1))
+            RESULTS="${RESULTS}  PASS  ${desc}\n"
+          else
+            echo "FAIL"; FAIL=$((FAIL + 1))
+            RESULTS="${RESULTS}  FAIL  ${desc}\n"
+          fi
+        }
+
+        echo "==================================================="
+        echo "  OPENSHIFT SERVICE DNS TESTS"
+        echo "==================================================="
+        echo ""
+
+        echo "--- Backend Service ---"
+        BACKEND_SVC=$(oc get svc pw-backend-svc -n "${NS}" \
+          -o jsonpath='{.spec.clusterIP}' 2>/dev/null || true)
+        echo "  ClusterIP:    ${BACKEND_SVC:-not found}"
+        run_check "backend Service exists" test -n "${BACKEND_SVC}"
+
+        BACKEND_EP=$(oc get endpoints pw-backend-svc -n "${NS}" \
+          -o jsonpath='{.subsets[*].addresses[*].ip}' 2>/dev/null || true)
+        echo "  Endpoint IPs: ${BACKEND_EP:-none}"
+        run_check "backend endpoint has IP" test -n "${BACKEND_EP}"
+
+        BACKEND_PORTS=$(oc get svc pw-backend-svc -n "${NS}" \
+          -o jsonpath='{range .spec.ports[*]}{.name}:{.port} {end}' 2>/dev/null || true)
+        echo "  Ports:        ${BACKEND_PORTS:-none}"
+
+        echo ""
+        echo "--- Frontend Service ---"
+        FRONTEND_SVC=$(oc get svc pw-frontend-svc -n "${NS}" \
+          -o jsonpath='{.spec.clusterIP}' 2>/dev/null || true)
+        echo "  ClusterIP:    ${FRONTEND_SVC:-not found}"
+        run_check "frontend Service exists" test -n "${FRONTEND_SVC}"
+
+        FRONTEND_EP=$(oc get endpoints pw-frontend-svc -n "${NS}" \
+          -o jsonpath='{.subsets[*].addresses[*].ip}' 2>/dev/null || true)
+        echo "  Endpoint IPs: ${FRONTEND_EP:-none}"
+        run_check "frontend endpoint has IP" test -n "${FRONTEND_EP}"
+
+        echo ""
+        echo "--- App Health via Route ---"
+        echo "  Route: ${ROUTE}"
+        echo "  Waiting for app to become healthy..."
+        HEALTHY=false
+        for i in $(seq 1 60); do
+          STATUS=$(curl -sk "${ROUTE}/health" 2>/dev/null || true)
+          if echo "${STATUS}" | grep -q '"ok"'; then
+            echo "  App healthy after ${i} attempts ($((i * 5))s)."
+            HEALTHY=true
+            break
+          fi
+          sleep 5
+        done
+
+        HEALTH_RESP=$(curl -sk "${ROUTE}/health" 2>/dev/null || true)
+        echo "  Health: ${HEALTH_RESP}"
+        if ${HEALTHY}; then
+          echo "  CHECK: app healthy via Route ... PASS"
+          PASS=$((PASS + 1)); RESULTS="${RESULTS}  PASS  app healthy via Route\n"
+        else
+          echo "  CHECK: app healthy via Route ... FAIL"
+          FAIL=$((FAIL + 1)); RESULTS="${RESULTS}  FAIL  app healthy via Route\n"
+        fi
+
+        check_contains "database connected" "${HEALTH_RESP}" '"connected"'
+
+        echo ""
+        echo "==================================================="
+        echo "  OPENSHIFT SERVICE DNS TEST SUMMARY"
+        echo "==================================================="
+        echo -e "${RESULTS}"
+        echo "  RESULT: ${PASS}/$((PASS + FAIL)) passed"
+        echo "==================================================="
+        [ "${FAIL}" -eq 0 ] || exit 1
+---
+apiVersion: tekton.dev/v1
+kind: Task
+metadata:
+  name: test-ocp-app-api
+  annotations:
+    description: "Tests the app API end-to-end via OpenShift Route: POSTs 2 stops and verifies they appear."
+spec:
+  params:
+    - name: route-host
+      type: string
+      description: "Frontend route hostname (from deploy-test-vms)"
+  steps:
+    - name: test
+      image: image-registry.openshift-image-registry.svc:5000/openshift/cli:latest
+      timeout: 5m
+      script: |
+        #!/usr/bin/env bash
+        set -euo pipefail
+        ROUTE="https://$(params.route-host)"
+        PASS=0; FAIL=0; RESULTS=""
+
+        check_contains() {
+          local desc="$1" value="$2" pattern="$3"
+          echo -n "  CHECK: ${desc} ... "
+          if echo "${value}" | grep -q "${pattern}" 2>/dev/null; then
+            echo "PASS"; PASS=$((PASS + 1))
+            RESULTS="${RESULTS}  PASS  ${desc}\n"
+          else
+            echo "FAIL"; FAIL=$((FAIL + 1))
+            RESULTS="${RESULTS}  FAIL  ${desc}\n"
+          fi
+        }
+
+        run_check() {
+          local desc="$1"; shift
+          echo -n "  CHECK: ${desc} ... "
+          if "$@" >/dev/null 2>&1; then
+            echo "PASS"; PASS=$((PASS + 1))
+            RESULTS="${RESULTS}  PASS  ${desc}\n"
+          else
+            echo "FAIL"; FAIL=$((FAIL + 1))
+            RESULTS="${RESULTS}  FAIL  ${desc}\n"
+          fi
+        }
+
+        echo "==================================================="
+        echo "  OPENSHIFT APP API TESTS"
+        echo "==================================================="
+        echo ""
+
+        echo "--- Clean slate ---"
+        echo "  Deleting any existing stops so results are deterministic..."
+        EXISTING=$(curl -sk "${ROUTE}/api/stops")
+        OLD_IDS=$(echo "${EXISTING}" | grep -o '"id":[0-9]*' | grep -o '[0-9]*' || true)
+        DELETED=0
+        for ID in ${OLD_IDS}; do
+          curl -sk -X DELETE "${ROUTE}/api/stops/${ID}" >/dev/null 2>&1
+          DELETED=$((DELETED + 1))
+        done
+        echo "  Deleted ${DELETED} existing stop(s)."
+
+        VERIFY_EMPTY=$(curl -sk "${ROUTE}/api/stops")
+        EMPTY_COUNT=$(echo "${VERIFY_EMPTY}" | { grep -o '"id"' || true; } | wc -l | tr -d ' ')
+        run_check "table is empty (${EMPTY_COUNT} stops)" test "${EMPTY_COUNT}" -eq 0
+
+        NOW=$(date +%s)
+        X1=$(( (NOW % 80) + 10 ))
+        Y1=$(( (NOW / 2 % 80) + 10 ))
+        X2=$(( (NOW / 3 % 80) + 10 ))
+        Y2=$(( (NOW / 5 % 80) + 10 ))
+
+        echo ""
+        echo "--- Infrastructure detection ---"
+        INFRA=$(curl -sk "${ROUTE}/api/infra")
+        echo "  Infra: ${INFRA}"
+        PLATFORM=$(echo "${INFRA}" | grep -o '"platform":"[^"]*"' | cut -d'"' -f4)
+        echo "  Platform: ${PLATFORM}"
+        run_check "infra platform detected" test -n "${PLATFORM}"
+        run_check "infra platform is not Detecting..." test "${PLATFORM}" != "Detecting..."
+
+        echo ""
+        echo "--- POST stop 1: Build Cluster (x=${X1}, y=${Y1}) ---"
+        RESP1=$(curl -sk -X POST "${ROUTE}/api/stops" \
+          -H "Content-Type: application/json" \
+          -d "{\"name\":\"Build Cluster\",\"x\":${X1},\"y\":${Y1}}")
+        echo "  Response: ${RESP1}"
+        check_contains "POST stop 1 returned id" "${RESP1}" '"id"'
+        STOP_PLAT=$(echo "${RESP1}" | grep -o '"url":"[^"]*"' | cut -d'"' -f4)
+        echo "  Stop platform: ${STOP_PLAT}"
+        check_contains "stop records detected platform" "${STOP_PLAT}" "${PLATFORM}"
+
+        echo ""
+        echo "--- POST stop 2: Smoke Test (x=${X2}, y=${Y2}) ---"
+        RESP2=$(curl -sk -X POST "${ROUTE}/api/stops" \
+          -H "Content-Type: application/json" \
+          -d "{\"name\":\"Smoke Test\",\"x\":${X2},\"y\":${Y2}}")
+        echo "  Response: ${RESP2}"
+        check_contains "POST stop 2 returned id" "${RESP2}" '"id"'
+
+        echo ""
+        echo "--- GET /api/stops ---"
+        STOPS=$(curl -sk "${ROUTE}/api/stops")
+        COUNT=$(echo "${STOPS}" | { grep -o '"id"' || true; } | wc -l | tr -d ' ')
+        echo "  Stops returned: ${COUNT} (expected: 2)"
+        echo "  Response: ${STOPS}"
+        run_check "exactly 2 stops returned" test "${COUNT}" -eq 2
+
+        echo ""
+        echo "--- Frontend HTML ---"
+        HTTP_CODE=$(curl -sk -o /dev/null -w '%{http_code}' "${ROUTE}/")
+        echo "  HTTP status: ${HTTP_CODE}"
+        HTML=$(curl -sk "${ROUTE}/")
+        TITLE=$(echo "${HTML}" | grep -o '<title>[^<]*</title>' || echo "none")
+        echo "  Page title: ${TITLE}"
+        check_contains "frontend returns HTML" "${HTML}" "<html"
+
+        echo ""
+        echo "==================================================="
+        echo "  OPENSHIFT APP API TEST SUMMARY"
+        echo "==================================================="
+        echo -e "${RESULTS}"
+        echo "  RESULT: ${PASS}/$((PASS + FAIL)) passed"
+        echo "==================================================="
+        [ "${FAIL}" -eq 0 ] || exit 1
+---
+apiVersion: tekton.dev/v1
+kind: Task
+metadata:
+  name: test-legacy-backend
+  annotations:
+    description: "Verifies backend VM is Legacy Infra-ready: Avahi/mDNS, hostname, PostgreSQL, qemu-guest-agent."
+spec:
+  params:
+    - name: namespace
+      type: string
+      default: "workload-portability-build"
+  steps:
+    - name: test
+      image: alpine:3.21
+      timeout: 5m
+      script: |
+        #!/bin/sh
+        set -euo pipefail
+        apk add --no-cache openssh-client sshpass >/dev/null 2>&1
+
+        HOST="pw-backend-svc"
+        SSH="sshpass -p openshift ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR root@${HOST}"
+        PASS=0; FAIL=0; RESULTS=""
+
+        run_check() {
+          local desc="$1"; shift
+          echo -n "  CHECK: ${desc} ... "
+          if "$@" >/dev/null 2>&1; then
+            echo "PASS"; PASS=$((PASS + 1))
+            RESULTS="${RESULTS}  PASS | ${desc}\n"
+          else
+            echo "FAIL"; FAIL=$((FAIL + 1))
+            RESULTS="${RESULTS}  FAIL | ${desc}\n"
+          fi
+        }
+
+        check_contains() {
+          local desc="$1" value="$2" pattern="$3"
+          echo -n "  CHECK: ${desc} ... "
+          if echo "${value}" | grep -q "${pattern}" 2>/dev/null; then
+            echo "PASS"; PASS=$((PASS + 1))
+            RESULTS="${RESULTS}  PASS | ${desc}\n"
+          else
+            echo "FAIL (got: '${value}')"; FAIL=$((FAIL + 1))
+            RESULTS="${RESULTS}  FAIL | ${desc}  [got: '${value}']\n"
+          fi
+        }
+
+        echo "==================================================="
+        echo "  LEGACY INFRA READINESS TESTS: Backend VM"
+        echo "==================================================="
+        echo ""
+        echo "  These tests verify the backend VM will work"
+        echo "  correctly when deployed on Legacy Infra (no Kubernetes)."
+        echo "  The VM must be self-contained: PostgreSQL running,"
+        echo "  database seeded, and Avahi advertising so the"
+        echo "  frontend VM can find it via mDNS."
+        echo ""
+
+        echo "--- SSH connectivity ---"
+        echo "  Waiting for SSH on ${HOST}..."
+        SSH_OK=false
+        for i in $(seq 1 30); do
+          if ${SSH} "echo ok" >/dev/null 2>&1; then
+            echo "  SSH ready after ${i} attempts."
+            SSH_OK=true
+            break
+          fi
+          sleep 5
+        done
+        if ! ${SSH_OK}; then
+          echo "  FATAL: Cannot SSH into backend VM after 30 attempts" >&2
+          exit 1
+        fi
+
+        echo ""
+        echo "--- Hostname ---"
+        echo "  The hostname must match the Kubernetes Service name so the"
+        echo "  same app config works on both OpenShift (DNS) and Legacy Infra (mDNS)."
+        ACTUAL_HOSTNAME=$(${SSH} "hostname" 2>/dev/null || true)
+        echo "  expected: pw-backend-svc"
+        echo "  actual:   ${ACTUAL_HOSTNAME}"
+        run_check "hostname = pw-backend-svc" \
+          test "${ACTUAL_HOSTNAME}" = "pw-backend-svc"
+
+        echo ""
+        echo "--- Services ---"
+        echo "  These services must be running for the VM to function on Legacy Infra."
+        for SVC in avahi-daemon dbus qemu-guest-agent postgresql; do
+          SVC_STATUS=$(${SSH} "rc-service ${SVC} status 2>/dev/null" || true)
+          echo "  ${SVC}: ${SVC_STATUS}"
+          run_check "${SVC} is running" \
+            ${SSH} "rc-service ${SVC} status | grep -q started"
+        done
+
+        echo ""
+        echo "--- Legacy Infra tooling ---"
+        echo "  These packages must be pre-installed for Legacy Infra deployment."
+        run_check "avahi-tools installed" \
+          ${SSH} "which avahi-resolve"
+        run_check "virt-what installed" \
+          ${SSH} "which virt-what"
+        VIRT_TYPE=$(${SSH} "virt-what 2>/dev/null" || true)
+        echo "  virt-what reports: ${VIRT_TYPE:-empty}"
+        run_check "virt-what detects hypervisor" test -n "${VIRT_TYPE}"
+        run_check "check-db-seed.sh exists" \
+          ${SSH} "test -x /root/check-db-seed.sh"
+        run_check "db-seed.sh exists" \
+          ${SSH} "test -x /root/db-seed.sh"
+
+        echo ""
+        echo "--- Platform network service ---"
+        echo "  The platform-network service detects the hypervisor at boot and"
+        echo "  sets /etc/network/interfaces accordingly:"
+        echo "    KVM (OpenShift) → DHCP  (masquerade gives 10.0.2.x)"
+        echo "    Legacy Infra          → keeps existing config"
+        echo "  This test VM runs on KVM, so DHCP should be active."
+
+        run_check "platform_network.sh exists" \
+          ${SSH} "test -x /root/platform_network.sh"
+        run_check "platform-network in boot runlevel" \
+          ${SSH} "rc-update show boot | grep -q platform-network"
+
+        NET_CONF=$(${SSH} "cat /etc/network/interfaces 2>/dev/null" || true)
+        echo "  /etc/network/interfaces:"
+        echo "${NET_CONF}" | sed 's/^/    /'
+        check_contains "interfaces configured for DHCP" "${NET_CONF}" "dhcp"
+
+        VM_IP=$(${SSH} "ip -4 addr show eth0 2>/dev/null | awk '/inet / {print \$2}'" || true)
+        echo "  eth0 address: ${VM_IP:-none}"
+        check_contains "VM has masquerade IP (10.0.2.x)" "${VM_IP}" "^10\\.0\\.2\\."
+
+        echo ""
+        echo "--- Infrastructure detection ---"
+        echo "  The portable-infra-detect service runs at boot to identify the"
+        echo "  hosting platform (Legacy Infra, ROSA, ARO, etc.) and writes the result"
+        echo "  to /run/portable-infra as JSON for the frontend app to display."
+
+        run_check "portable-infra-detect.sh exists" \
+          ${SSH} "test -x /usr/local/bin/portable-infra-detect.sh"
+        run_check "portable-infra-detect in default runlevel" \
+          ${SSH} "rc-update show default | grep -q portable-infra-detect"
+
+        INFRA_JSON=$(${SSH} "cat /run/portable-infra 2>/dev/null" || true)
+        echo "  /run/portable-infra: ${INFRA_JSON:-NOT FOUND}"
+        run_check "/run/portable-infra exists" test -n "${INFRA_JSON}"
+        check_contains "infra JSON has platform field" "${INFRA_JSON}" '"platform"'
+
+        echo ""
+        echo "--- mDNS / Avahi ---"
+        echo "  On Legacy Infra there is no DNS server. VMs discover each other using"
+        echo "  multicast DNS (mDNS) via Avahi. Each VM announces its hostname"
+        echo "  on the .local domain, so the frontend can reach this backend at"
+        echo "  'pw-backend-svc.local' without any DNS infrastructure."
+
+        echo ""
+        echo "  Hostname advertisement (avahi-resolve-host-name -4):"
+        echo "  This VM should announce itself as '${ACTUAL_HOSTNAME}.local'"
+        AVAHI_HOST=$(${SSH} "avahi-resolve-host-name -4 ${ACTUAL_HOSTNAME}.local 2>/dev/null" || true)
+        MDNS_IP=$(echo "${AVAHI_HOST}" | awk '{print $2}')
+        echo "  result: ${ACTUAL_HOSTNAME}.local -> ${MDNS_IP:-FAILED TO RESOLVE}"
+        run_check "mDNS: ${ACTUAL_HOSTNAME}.local resolves (IPv4)" test -n "${AVAHI_HOST}"
+        if [ -n "${MDNS_IP}" ]; then
+          echo "  This means: on Legacy Infra, the frontend connects to PostgreSQL at"
+          echo "  ${ACTUAL_HOSTNAME}.local:5432 (IP: ${MDNS_IP})"
+        fi
+
+        echo ""
+        echo "  Published services (avahi-browse):"
+        echo "  Avahi auto-publishes services like SSH. This proves the"
+        echo "  daemon is actively advertising on the network."
+        AVAHI_SERVICES=$(${SSH} "avahi-browse -a -t 2>/dev/null" || true)
+        AVAHI_COUNT=0
+        if [ -n "${AVAHI_SERVICES}" ]; then
+          AVAHI_COUNT=$(echo "${AVAHI_SERVICES}" | wc -l)
+          echo "${AVAHI_SERVICES}" | head -10 | sed 's/^/    /'
+          if [ "${AVAHI_COUNT}" -gt 10 ]; then
+            echo "    ... (${AVAHI_COUNT} total services)"
+          fi
+        else
+          echo "    (none)"
+        fi
+        run_check "avahi publishing services (found ${AVAHI_COUNT})" test -n "${AVAHI_SERVICES}"
+
+        echo ""
+        echo "--- PostgreSQL config ---"
+        echo "  PostgreSQL must accept network connections so the frontend VM"
+        echo "  can connect from a different IP (not just localhost)."
+        LISTEN=$(${SSH} "grep '^listen_addresses' /var/lib/postgresql/17/data/postgresql.conf" 2>/dev/null || true)
+        echo "  expected: listen_addresses = '*' (all interfaces)"
+        echo "  actual:   ${LISTEN:-not found}"
+        check_contains "listen_addresses = '*'" "${LISTEN}" "\\*"
+
+        HBA=$(${SSH} "grep todo /var/lib/postgresql/17/data/pg_hba.conf" 2>/dev/null || true)
+        echo "  expected: host  todo  todo  0.0.0.0/0  scram-sha-256"
+        echo "  actual:   ${HBA:-not found}"
+        check_contains "pg_hba allows todo connections" "${HBA}" "0.0.0.0/0"
+
+        echo ""
+        echo "--- Database state ---"
+        echo "  The one-shot seed service should have created the todo role,"
+        echo "  database, and stops table on first boot."
+        ROLE_EXISTS=$(${SSH} "su - postgres -c \"psql -tAc \\\"SELECT rolname FROM pg_roles WHERE rolname='todo'\\\"\"" 2>/dev/null || true)
+        echo "  todo role:     ${ROLE_EXISTS:-NOT FOUND}"
+        run_check "todo role exists" test "${ROLE_EXISTS}" = "todo"
+
+        DB_EXISTS=$(${SSH} "su - postgres -c \"psql -tAc \\\"SELECT datname FROM pg_database WHERE datname='todo'\\\"\"" 2>/dev/null || true)
+        echo "  todo database: ${DB_EXISTS:-NOT FOUND}"
+        run_check "todo database exists" test "${DB_EXISTS}" = "todo"
+
+        TABLE_EXISTS=$(${SSH} "su - postgres -c \"psql -d todo -tAc \\\"SELECT tablename FROM pg_tables WHERE tablename='stops'\\\"\"" 2>/dev/null || true)
+        echo "  stops table:   ${TABLE_EXISTS:-NOT FOUND}"
+        run_check "stops table exists" test "${TABLE_EXISTS}" = "stops"
+
+        COLUMNS=$(${SSH} "su - postgres -c \"psql -d todo -tAc \\\"SELECT column_name FROM information_schema.columns WHERE table_name='stops' ORDER BY ordinal_position\\\"\"" 2>/dev/null || true)
+        COL_LIST=$(echo "${COLUMNS}" | tr '\n' ',' | sed 's/,$//')
+        echo "  stops columns: ${COL_LIST:-NONE}"
+        echo "  expected:      id,name,x,y,color,created_at,url"
+
+        echo ""
+        echo "--- Seed service ---"
+        echo "  The DB seed service should run once then disable itself."
+        SEED_STATUS=$(${SSH} "rc-update show default 2>/dev/null | grep seed" || true)
+        echo "  seed in default runlevel: ${SEED_STATUS:-no (correct - self-disabled)}"
+        run_check "seed service self-disabled after first boot" \
+          ${SSH} "! rc-update show default | grep -q pw-db-seed"
+
+        echo ""
+        echo "--- Cloud-init ---"
+        echo "  Cloud-init must be fully disabled. On Legacy Infra there is no"
+        echo "  cloud metadata service, so cloud-init would hang on boot."
+        CLOUD_DISABLED=$(${SSH} "test -f /etc/cloud/cloud-init.disabled && echo yes || echo no" 2>/dev/null || true)
+        echo "  /etc/cloud/cloud-init.disabled exists: ${CLOUD_DISABLED}"
+        CLOUD_SERVICES=$(${SSH} "rc-update show default 2>/dev/null | grep cloud" || true)
+        echo "  cloud services in default runlevel: ${CLOUD_SERVICES:-none (correct)}"
+        run_check "cloud-init.disabled file exists" \
+          ${SSH} "test -f /etc/cloud/cloud-init.disabled"
+        run_check "no cloud services in default runlevel" \
+          ${SSH} "! rc-update show default | grep -q cloud"
+
+        echo ""
+        echo "==================================================="
+        echo "  LEGACY INFRA READINESS SUMMARY: Backend VM"
+        echo "==================================================="
+        echo -e "${RESULTS}"
+        echo "  RESULT: ${PASS}/$((PASS + FAIL)) passed"
+        echo "==================================================="
+        [ "${FAIL}" -eq 0 ] || exit 1
+---
+apiVersion: tekton.dev/v1
+kind: Task
+metadata:
+  name: test-legacy-frontend
+  annotations:
+    description: "Verifies frontend VM is Legacy Infra-ready: Avahi/mDNS, app service, env config, qemu-guest-agent."
+spec:
+  params:
+    - name: namespace
+      type: string
+      default: "workload-portability-build"
+  steps:
+    - name: test
+      image: alpine:3.21
+      timeout: 5m
+      script: |
+        #!/bin/sh
+        set -euo pipefail
+        apk add --no-cache openssh-client sshpass curl >/dev/null 2>&1
+
+        HOST="pw-frontend-svc"
+        SSH="sshpass -p openshift ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR root@${HOST}"
+        PASS=0; FAIL=0; RESULTS=""
+
+        run_check() {
+          local desc="$1"; shift
+          echo -n "  CHECK: ${desc} ... "
+          if "$@" >/dev/null 2>&1; then
+            echo "PASS"; PASS=$((PASS + 1))
+            RESULTS="${RESULTS}  PASS | ${desc}\n"
+          else
+            echo "FAIL"; FAIL=$((FAIL + 1))
+            RESULTS="${RESULTS}  FAIL | ${desc}\n"
+          fi
+        }
+
+        check_contains() {
+          local desc="$1" value="$2" pattern="$3"
+          echo -n "  CHECK: ${desc} ... "
+          if echo "${value}" | grep -q "${pattern}" 2>/dev/null; then
+            echo "PASS"; PASS=$((PASS + 1))
+            RESULTS="${RESULTS}  PASS | ${desc}\n"
+          else
+            echo "FAIL (got: '${value}')"; FAIL=$((FAIL + 1))
+            RESULTS="${RESULTS}  FAIL | ${desc}  [got: '${value}']\n"
+          fi
+        }
+
+        echo "==================================================="
+        echo "  LEGACY INFRA READINESS TESTS: Frontend VM"
+        echo "==================================================="
+        echo ""
+        echo "  These tests verify the frontend VM will work"
+        echo "  correctly when deployed on Legacy Infra (no Kubernetes)."
+        echo "  The VM must be self-contained: Node.js app running"
+        echo "  on port 80, configured to find the backend via"
+        echo "  mDNS, and Avahi advertising its own hostname."
+        echo ""
+
+        echo "--- SSH connectivity ---"
+        echo "  Waiting for SSH on ${HOST}..."
+        SSH_OK=false
+        for i in $(seq 1 30); do
+          if ${SSH} "echo ok" >/dev/null 2>&1; then
+            echo "  SSH ready after ${i} attempts."
+            SSH_OK=true
+            break
+          fi
+          sleep 5
+        done
+        if ! ${SSH_OK}; then
+          echo "  FATAL: Cannot SSH into frontend VM after 30 attempts" >&2
+          exit 1
+        fi
+
+        echo ""
+        echo "--- Hostname ---"
+        echo "  The hostname identifies this VM on the network."
+        echo "  On Legacy Infra, Avahi will publish it as pw-frontend.local"
+        ACTUAL_HOSTNAME=$(${SSH} "hostname" 2>/dev/null || true)
+        echo "  expected: pw-frontend"
+        echo "  actual:   ${ACTUAL_HOSTNAME}"
+        run_check "hostname = pw-frontend" \
+          test "${ACTUAL_HOSTNAME}" = "pw-frontend"
+
+        echo ""
+        echo "--- Services ---"
+        echo "  These services must be running for the VM to function on Legacy Infra."
+        for SVC in avahi-daemon dbus qemu-guest-agent portable-workload; do
+          SVC_STATUS=$(${SSH} "rc-service ${SVC} status 2>/dev/null" || true)
+          echo "  ${SVC}: ${SVC_STATUS}"
+          run_check "${SVC} is running" \
+            ${SSH} "rc-service ${SVC} status | grep -q started"
+        done
+
+        echo ""
+        echo "--- Legacy Infra tooling ---"
+        echo "  These packages must be pre-installed for Legacy Infra deployment."
+        run_check "avahi-tools installed" \
+          ${SSH} "which avahi-resolve"
+        run_check "virt-what installed" \
+          ${SSH} "which virt-what"
+        VIRT_TYPE=$(${SSH} "virt-what 2>/dev/null" || true)
+        echo "  virt-what reports: ${VIRT_TYPE:-empty}"
+        run_check "virt-what detects hypervisor" test -n "${VIRT_TYPE}"
+
+        echo ""
+        echo "--- Platform network service ---"
+        echo "  The platform-network service detects the hypervisor at boot and"
+        echo "  sets /etc/network/interfaces to DHCP on both KVM and Legacy Infra."
+
+        run_check "platform_network.sh exists" \
+          ${SSH} "test -x /root/platform_network.sh"
+        run_check "platform-network in boot runlevel" \
+          ${SSH} "rc-update show boot | grep -q platform-network"
+
+        NET_CONF=$(${SSH} "cat /etc/network/interfaces 2>/dev/null" || true)
+        echo "  /etc/network/interfaces:"
+        echo "${NET_CONF}" | sed 's/^/    /'
+        check_contains "interfaces configured for DHCP" "${NET_CONF}" "dhcp"
+
+        VM_IP=$(${SSH} "ip -4 addr show eth0 2>/dev/null | awk '/inet / {print \$2}'" || true)
+        echo "  eth0 address: ${VM_IP:-none}"
+        check_contains "VM has masquerade IP (10.0.2.x)" "${VM_IP}" "^10\\.0\\.2\\."
+
+        echo ""
+        echo "--- Infrastructure detection ---"
+        echo "  The portable-infra-detect service runs at boot to identify the"
+        echo "  hosting platform (Legacy Infra, ROSA, ARO, etc.) and writes the result"
+        echo "  to /run/portable-infra as JSON for the frontend app to display."
+
+        run_check "portable-infra-detect.sh exists" \
+          ${SSH} "test -x /usr/local/bin/portable-infra-detect.sh"
+        run_check "portable-infra-detect in default runlevel" \
+          ${SSH} "rc-update show default | grep -q portable-infra-detect"
+
+        INFRA_JSON=$(${SSH} "cat /run/portable-infra 2>/dev/null" || true)
+        echo "  /run/portable-infra: ${INFRA_JSON:-NOT FOUND}"
+        run_check "/run/portable-infra exists" test -n "${INFRA_JSON}"
+        check_contains "infra JSON has platform field" "${INFRA_JSON}" '"platform"'
+
+        echo ""
+        echo "--- Service start_pre() gate ---"
+        echo "  The frontend service uses virt-what to decide whether to resolve"
+        echo "  DB_HOST via mDNS (Legacy Infra) or leave it as a K8s service name (OpenShift)."
+        echo "  On this OpenShift test VM, virt-what should report KVM,"
+        echo "  so the mDNS path should be skipped entirely."
+        run_check "virt-what reports KVM (OpenShift gate)" \
+          ${SSH} "virt-what 2>/dev/null | grep -qi kvm"
+
+        echo ""
+        echo "--- mDNS / Avahi ---"
+        echo "  On Legacy Infra there is no DNS server. VMs discover each other using"
+        echo "  multicast DNS (mDNS) via Avahi. This VM announces itself as"
+        echo "  'pw-frontend.local' so other systems can find it."
+        echo "  The frontend finds the backend at 'pw-backend-svc.local'."
+
+        echo ""
+        echo "  Hostname advertisement (avahi-resolve-host-name -4):"
+        echo "  This VM should announce itself as '${ACTUAL_HOSTNAME}.local'"
+        AVAHI_HOST=$(${SSH} "avahi-resolve-host-name -4 ${ACTUAL_HOSTNAME}.local 2>/dev/null" || true)
+        MDNS_IP=$(echo "${AVAHI_HOST}" | awk '{print $2}')
+        echo "  result: ${ACTUAL_HOSTNAME}.local -> ${MDNS_IP:-FAILED TO RESOLVE}"
+        run_check "mDNS: ${ACTUAL_HOSTNAME}.local resolves (IPv4)" test -n "${AVAHI_HOST}"
+        if [ -n "${MDNS_IP}" ]; then
+          echo "  This means: on Legacy Infra, this frontend is reachable at"
+          echo "  ${ACTUAL_HOSTNAME}.local:80 (IP: ${MDNS_IP})"
+        fi
+
+        echo ""
+        echo "  Published services (avahi-browse):"
+        echo "  Avahi auto-publishes services like SSH. This proves the"
+        echo "  daemon is actively advertising on the network."
+        AVAHI_SERVICES=$(${SSH} "avahi-browse -a -t 2>/dev/null" || true)
+        AVAHI_COUNT=0
+        if [ -n "${AVAHI_SERVICES}" ]; then
+          AVAHI_COUNT=$(echo "${AVAHI_SERVICES}" | wc -l)
+          echo "${AVAHI_SERVICES}" | head -10 | sed 's/^/    /'
+          if [ "${AVAHI_COUNT}" -gt 10 ]; then
+            echo "    ... (${AVAHI_COUNT} total services)"
+          fi
+        else
+          echo "    (none)"
+        fi
+        run_check "avahi publishing services (found ${AVAHI_COUNT})" test -n "${AVAHI_SERVICES}"
+
+        echo ""
+        echo "--- App configuration ---"
+        echo "  The env file tells the Node.js app where to find the backend DB."
+        echo "  DB_HOST=pw-backend-svc works on both OpenShift (K8s DNS)"
+        echo "  and Legacy Infra (the app falls back to pw-backend-svc.local via mDNS)."
+        ENV_FILE=$(${SSH} "cat /etc/portable-workload.env" 2>/dev/null || true)
+        echo "  /etc/portable-workload.env:"
+        echo "${ENV_FILE}" | sed 's/^/    /'
+        check_contains "DB_HOST=pw-backend-svc" "${ENV_FILE}" "DB_HOST=pw-backend-svc"
+        check_contains "PORT=80" "${ENV_FILE}" "PORT=80"
+
+        echo ""
+        echo "--- App files ---"
+        echo "  The Node.js app must be installed at /opt/portable-workload/"
+        APP_FILES=$(${SSH} "ls -la /opt/portable-workload/ 2>/dev/null" || true)
+        echo "${APP_FILES}" | sed 's/^/    /'
+        run_check "server.js exists" \
+          ${SSH} "test -f /opt/portable-workload/server.js"
+        run_check "node_modules exists" \
+          ${SSH} "test -d /opt/portable-workload/node_modules"
+        run_check "public directory exists" \
+          ${SSH} "test -d /opt/portable-workload/public"
+
+        echo ""
+        echo "--- App health ---"
+        echo "  The app must be listening on port 80 and responding to requests."
+        LISTEN_80=$(${SSH} "netstat -tln 2>/dev/null | grep ':80 '" || true)
+        echo "  port 80 listener: ${LISTEN_80:-not found}"
+        run_check "port 80 is listening" test -n "${LISTEN_80}"
+
+        HEALTH=$(${SSH} "curl -sf http://localhost:80/health 2>/dev/null" || true)
+        echo "  /health response: ${HEALTH:-no response}"
+        check_contains "/health returns ok" "${HEALTH}" '"status":"ok"'
+        check_contains "/health shows db connected" "${HEALTH}" '"database":"connected"'
+
+        echo ""
+        echo "--- App log (last 10 lines) ---"
+        APP_LOG=$(${SSH} "tail -10 /var/log/portable-workload.log 2>/dev/null" || true)
+        if [ -n "${APP_LOG}" ]; then
+          echo "${APP_LOG}" | sed 's/^/    /'
+        else
+          echo "    (no log output)"
+        fi
+
+        echo ""
+        echo "--- Cloud-init ---"
+        echo "  Cloud-init must be fully disabled. On Legacy Infra there is no"
+        echo "  cloud metadata service, so cloud-init would hang on boot."
+        CLOUD_DISABLED=$(${SSH} "test -f /etc/cloud/cloud-init.disabled && echo yes || echo no" 2>/dev/null || true)
+        echo "  /etc/cloud/cloud-init.disabled exists: ${CLOUD_DISABLED}"
+        CLOUD_SERVICES=$(${SSH} "rc-update show default 2>/dev/null | grep cloud" || true)
+        echo "  cloud services in default runlevel: ${CLOUD_SERVICES:-none (correct)}"
+        run_check "cloud-init.disabled file exists" \
+          ${SSH} "test -f /etc/cloud/cloud-init.disabled"
+        run_check "no cloud services in default runlevel" \
+          ${SSH} "! rc-update show default | grep -q cloud"
+
+        echo ""
+        echo "==================================================="
+        echo "  LEGACY INFRA READINESS SUMMARY: Frontend VM"
+        echo "==================================================="
+        echo -e "${RESULTS}"
+        echo "  RESULT: ${PASS}/$((PASS + FAIL)) passed"
+        echo "==================================================="
+        [ "${FAIL}" -eq 0 ] || exit 1
+---
+apiVersion: tekton.dev/v1
+kind: Task
+metadata:
+  name: validate-vm-artifacts
+  annotations:
+    description: "Validates VM disk artifacts (qcow2 + VMDK) are present and well-formed using qemu-img."
+spec:
+  workspaces:
+    - name: artifacts
+  params:
+    - name: image-registry
+      type: string
+      default: "image-registry.openshift-image-registry.svc:5000/workload-portability-build"
+  steps:
+    - name: validate
+      image: $(params.image-registry)/golden-builder:latest
+      script: |
+        #!/usr/bin/env bash
+        set -euo pipefail
+        ARTIFACTS="$(workspaces.artifacts.path)"
+        PASS=0; FAIL=0; RESULTS=""
+
+        run_check() {
+          local desc="$1"; shift
+          echo -n "  CHECK: ${desc} ... "
+          if "$@" >/dev/null 2>&1; then
+            echo "PASS"; PASS=$((PASS + 1))
+            RESULTS="${RESULTS}  PASS  ${desc}\n"
+          else
+            echo "FAIL"; FAIL=$((FAIL + 1))
+            RESULTS="${RESULTS}  FAIL  ${desc}\n"
+          fi
+        }
+
+        echo "==================================================="
+        echo "  VM ARTIFACT VALIDATION"
+        echo "==================================================="
+        echo ""
+
+        echo "--- Artifact directory listing ---"
+        ls -lh "${ARTIFACTS}"/portable_*.{qcow2,vmdk} 2>/dev/null | sed 's/^/    /' || echo "    (no artifacts found)"
+        echo ""
+
+        for ROLE in backend frontend; do
+          QCOW="${ARTIFACTS}/pw_${ROLE}.qcow2"
+          VMDK="${ARTIFACTS}/pw_${ROLE}.vmdk"
+
+          echo "--- ${ROLE} VM ---"
+          run_check "${ROLE} qcow2 exists" test -f "${QCOW}"
+          run_check "${ROLE} vmdk exists" test -f "${VMDK}"
+
+          if [ -f "${QCOW}" ]; then
+            echo "  qcow2 details:"
+            qemu-img info "${QCOW}" 2>/dev/null | sed 's/^/    /'
+            FORMAT=$(qemu-img info "${QCOW}" 2>/dev/null | awk '/^file format:/{print $3}')
+            run_check "${ROLE} qcow2 format is qcow2" test "${FORMAT}" = "qcow2"
+          fi
+
+          if [ -f "${VMDK}" ]; then
+            echo "  vmdk details:"
+            qemu-img info "${VMDK}" 2>/dev/null | sed 's/^/    /'
+            FORMAT=$(qemu-img info "${VMDK}" 2>/dev/null | awk '/^file format:/{print $3}')
+            run_check "${ROLE} vmdk format is vmdk" test "${FORMAT}" = "vmdk"
+          fi
+          echo ""
+        done
+
+        echo "==================================================="
+        echo "  ARTIFACT VALIDATION SUMMARY"
+        echo "==================================================="
+        echo -e "${RESULTS}"
+        echo "  RESULT: ${PASS}/$((PASS + FAIL)) passed"
+        echo "==================================================="
+        [ "${FAIL}" -eq 0 ] || exit 1
+---
+apiVersion: tekton.dev/v1
+kind: Task
+metadata:
+  name: cleanup-test-vms
+  annotations:
+    description: "Removes all smoke test resources (VMs, Services, Route) by label."
+spec:
+  params:
+    - name: namespace
+      type: string
+      default: "workload-portability-build"
+  steps:
+    - name: cleanup
+      image: image-registry.openshift-image-registry.svc:5000/openshift/cli:latest
+      script: |
+        #!/usr/bin/env bash
+        set -uo pipefail
+        NS="$(params.namespace)"
+        LABEL="app.kubernetes.io/part-of=pw-smoke-test"
+
+        echo ">>> Cleaning up smoke test resources..."
+        oc delete vm -l "${LABEL}" -n "${NS}" --ignore-not-found=true
+        oc delete svc -l "${LABEL}" -n "${NS}" --ignore-not-found=true
+        oc delete route -l "${LABEL}" -n "${NS}" --ignore-not-found=true
+        echo ">>> Cleanup complete."
+---
+apiVersion: tekton.dev/v1
+kind: Task
+metadata:
+  name: generate-lb-config
+  annotations:
+    description: "Reads cluster data from the installation-dashboard-clusters Secret, logs into each OpenShift cluster to discover its apps domain, and generates a loadbalancer config ConfigMap."
+spec:
+  params:
+    - name: namespace
+      type: string
+      default: "workload-portability-build"
+  results:
+    - name: apps-domain
+      description: "The apps domain of the build cluster (for the loadbalancer Route)"
+  steps:
+    - name: generate
+      image: image-registry.openshift-image-registry.svc:5000/openshift/cli:latest
+      script: |
+        #!/usr/bin/env bash
+        set -euo pipefail
+        NS="$(params.namespace)"
+
+        echo ">>> Reading cluster data from Secret..."
+        CLUSTERS_JSON=$(oc get secret installation-dashboard-clusters -n "${NS}" -o jsonpath='{.data.clusters}' | base64 -d)
+
+        echo ">>> Discovering build cluster apps domain..."
+        BUILD_APPS_DOMAIN=$(oc get ingresses.config.openshift.io cluster -o jsonpath='{.spec.domain}')
+        echo "Build cluster apps domain: ${BUILD_APPS_DOMAIN}"
+        printf "%s" "${BUILD_APPS_DOMAIN}" > "$(results.apps-domain.path)"
+
+        echo ">>> Generating loadbalancer config..."
+        CONFIG="title: \"Application LB\"\ninitialActive: 1\ndomain: \"portable-workload.${BUILD_APPS_DOMAIN}\"\n\nnodes:\n"
+
+        SORTED=$(echo "${CLUSTERS_JSON}" | python3 -c "
+        import json, sys
+        data = json.load(sys.stdin)
+        items = sorted(data.items(), key=lambda x: x[1].get('lbPosition', 999))
+        for name, c in items:
+            if c.get('excludeFromLb'):
+                print(f'Skipping {name} (excludeFromLb)', file=sys.stderr)
+                continue
+            if 'acm' in c.get('assignedRoles', []):
+                print(f'Skipping {name} (ACM hub)', file=sys.stderr)
+                continue
+            t = c.get('type', 'openshift')
+            print(f'{name}\t{t}\t{json.dumps(c)}')
+        ")
+
+        POS=1
+        while IFS=$'\t' read -r NAME TYPE CJSON; do
+          [ -z "${NAME}" ] && continue
+
+          if [ "${TYPE}" = "legacy" ]; then
+            URL=$(echo "${CJSON}" | python3 -c "import json,sys; print(json.load(sys.stdin).get('workloadUrl',''))")
+            ICON="vm"
+            echo "  Legacy Infra cluster '${NAME}' -> ${URL}"
+          else
+            API=$(echo "${CJSON}" | python3 -c "import json,sys; print(json.load(sys.stdin).get('api',''))")
+            USER=$(echo "${CJSON}" | python3 -c "import json,sys; print(json.load(sys.stdin).get('user',''))")
+            PASS=$(echo "${CJSON}" | python3 -c "import json,sys; print(json.load(sys.stdin).get('password',''))")
+
+            echo "  Logging into OpenShift cluster '${NAME}' at ${API}..."
+            oc login --insecure-skip-tls-verify -u "${USER}" -p "${PASS}" "${API}" > /dev/null 2>&1 || {
+              echo "  WARNING: Could not log into ${NAME}, skipping"
+              continue
+            }
+            APPS_DOMAIN=$(oc get ingresses.config.openshift.io cluster -o jsonpath='{.spec.domain}')
+            URL="https://portable-workload-vm.${APPS_DOMAIN}"
+            ICON="cloud"
+            echo "  OpenShift cluster '${NAME}' -> ${URL}"
+          fi
+
+          CONFIG="${CONFIG}  - name: \"${NAME}\"\n    position: ${POS}\n    icon: ${ICON}\n    url: ${URL}\n\n"
+          POS=$((POS + 1))
+        done <<< "${SORTED}"
+
+        echo ">>> Creating/updating ConfigMap faux-lb-config..."
+        printf "${CONFIG}" > /tmp/config.yaml
+        cat /tmp/config.yaml
+
+        LOCAL_TOKEN=$(cat /var/run/secrets/kubernetes.io/serviceaccount/token)
+        LOCAL_API="https://${KUBERNETES_SERVICE_HOST}:${KUBERNETES_SERVICE_PORT}"
+        oc create configmap faux-lb-config --from-file=config.yaml=/tmp/config.yaml -n "${NS}" --dry-run=client -o yaml | \
+          oc apply --server="${LOCAL_API}" --token="${LOCAL_TOKEN}" --certificate-authority=/var/run/secrets/kubernetes.io/serviceaccount/ca.crt -f - -n "${NS}"
+        echo ">>> Config generation complete."
+---
+apiVersion: tekton.dev/v1
+kind: Task
+metadata:
+  name: deploy-loadbalancer
+  annotations:
+    description: "Deploys the loadbalancer Deployment, Service, and Route on the build cluster."
+spec:
+  params:
+    - name: namespace
+      type: string
+      default: "workload-portability-build"
+    - name: image-registry
+      type: string
+      default: "image-registry.openshift-image-registry.svc:5000/workload-portability-build"
+    - name: apps-domain
+      type: string
+      description: "The build cluster apps domain for the Route host"
+  steps:
+    - name: deploy
+      image: image-registry.openshift-image-registry.svc:5000/openshift/cli:latest
+      script: |
+        #!/usr/bin/env bash
+        set -euo pipefail
+        NS="$(params.namespace)"
+        REGISTRY="$(params.image-registry)"
+        APPS_DOMAIN="$(params.apps-domain)"
+        IMAGE="${REGISTRY}/faux-loadbalancer:latest"
+        ROUTE_HOST="loadbalancer.${APPS_DOMAIN}"
+
+        echo ">>> Deploying loadbalancer to ${NS}..."
+        echo "    Image: ${IMAGE}"
+        echo "    Route: ${ROUTE_HOST}"
+
+        cat <<YAML | oc apply -f - -n "${NS}"
+        apiVersion: apps/v1
+        kind: Deployment
+        metadata:
+          name: loadbalancer
+          labels:
+            app: loadbalancer
+        spec:
+          replicas: 1
+          selector:
+            matchLabels:
+              app: loadbalancer
+          template:
+            metadata:
+              labels:
+                app: loadbalancer
+            spec:
+              containers:
+                - name: loadbalancer
+                  image: ${IMAGE}
+                  ports:
+                    - containerPort: 8080
+                  readinessProbe:
+                    httpGet:
+                      path: /api/state
+                      port: 8080
+                    initialDelaySeconds: 5
+                    periodSeconds: 10
+                  volumeMounts:
+                    - name: config
+                      mountPath: /app/config.yaml
+                      subPath: config.yaml
+              volumes:
+                - name: config
+                  configMap:
+                    name: faux-lb-config
+        ---
+        apiVersion: v1
+        kind: Service
+        metadata:
+          name: loadbalancer
+          labels:
+            app: loadbalancer
+        spec:
+          selector:
+            app: loadbalancer
+          ports:
+            - port: 8080
+              targetPort: 8080
+        ---
+        apiVersion: route.openshift.io/v1
+        kind: Route
+        metadata:
+          name: loadbalancer
+          labels:
+            app: loadbalancer
+        spec:
+          host: ${ROUTE_HOST}
+          to:
+            kind: Service
+            name: loadbalancer
+          port:
+            targetPort: 8080
+          tls:
+            termination: edge
+            insecureEdgeTerminationPolicy: Redirect
+        ---
+        apiVersion: route.openshift.io/v1
+        kind: Route
+        metadata:
+          name: portable-workload
+          labels:
+            app: loadbalancer
+        spec:
+          host: portable-workload.${APPS_DOMAIN}
+          to:
+            kind: Service
+            name: loadbalancer
+          port:
+            targetPort: 8080
+          tls:
+            termination: edge
+            insecureEdgeTerminationPolicy: Redirect
+        YAML
+
+        echo ">>> Restarting loadbalancer to pick up config changes..."
+        oc rollout restart deployment/loadbalancer -n "${NS}"
+        oc rollout status deployment/loadbalancer -n "${NS}" --timeout=120s
+
+        echo ">>> Loadbalancer deployed at https://${ROUTE_HOST}"
+---
+apiVersion: tekton.dev/v1
+kind: Task
+metadata:
+  name: onboard-clusters-to-acm
+  annotations:
+    description: "Reads cluster data from the installation-dashboard-clusters Secret, identifies the ACM hub cluster, and imports all other OpenShift clusters as ManagedClusters via auto-import."
+spec:
+  params:
+    - name: namespace
+      type: string
+      default: "workload-portability-build"
+  results:
+    - name: summary
+      description: "Summary of onboarding results"
+  steps:
+    - name: onboard
+      image: image-registry.openshift-image-registry.svc:5000/openshift/cli:latest
+      script: |
+        #!/usr/bin/env bash
+        set -euo pipefail
+        NS="$(params.namespace)"
+        LOCAL_TOKEN=$(cat /var/run/secrets/kubernetes.io/serviceaccount/token)
+        LOCAL_API="https://${KUBERNETES_SERVICE_HOST}:${KUBERNETES_SERVICE_PORT}"
+        LOCAL_CA=/var/run/secrets/kubernetes.io/serviceaccount/ca.crt
+
+        update_status() {
+          echo "${1}" > /tmp/acm-status.json
+          oc create configmap acm-onboard-status --from-file=status=/tmp/acm-status.json -n "${NS}" --dry-run=client -o yaml | \
+            oc apply --server="${LOCAL_API}" --token="${LOCAL_TOKEN}" --certificate-authority="${LOCAL_CA}" -f - -n "${NS}"
+        }
+
+        echo ">>> Reading cluster data from Secret..."
+        CLUSTERS_JSON=$(oc get secret installation-dashboard-clusters -n "${NS}" \
+          --server="${LOCAL_API}" --token="${LOCAL_TOKEN}" --certificate-authority="${LOCAL_CA}" \
+          -o jsonpath='{.data.clusters}' | base64 -d)
+
+        echo ">>> Finding ACM hub cluster..."
+        HUB_INFO=$(echo "${CLUSTERS_JSON}" | python3 -c "
+        import json, sys
+        data = json.load(sys.stdin)
+        for name, c in data.items():
+            roles = c.get('assignedRoles', [])
+            if 'acm' in roles and c.get('type', 'openshift') == 'openshift':
+                print(f'{name}\t{c[\"api\"]}\t{c[\"user\"]}\t{c[\"password\"]}')
+                sys.exit(0)
+        print('NOT_FOUND')
+        sys.exit(1)
+        ")
+
+        if [ "${HUB_INFO}" = "NOT_FOUND" ] || [ -z "${HUB_INFO}" ]; then
+          echo "ERROR: No cluster with ACM role found"
+          update_status '{"status":"failed","clusters":{},"message":"No cluster with ACM role found"}'
+          printf "No ACM hub cluster found" > "$(results.summary.path)"
+          exit 1
+        fi
+
+        IFS=$'\t' read -r HUB_NAME HUB_API HUB_USER HUB_PASS <<< "${HUB_INFO}"
+        echo "Hub cluster: ${HUB_NAME} at ${HUB_API}"
+
+        echo ">>> Logging into hub cluster..."
+        oc login --insecure-skip-tls-verify -u "${HUB_USER}" -p "${HUB_PASS}" "${HUB_API}" > /dev/null 2>&1
+
+        update_status '{"status":"running","clusters":{}}'
+
+        echo ">>> Collecting spoke clusters..."
+        SPOKES=$(echo "${CLUSTERS_JSON}" | python3 -c "
+        import json, sys, re
+        data = json.load(sys.stdin)
+        hub = '${HUB_NAME}'
+        platform_map = {
+            'azure': 'Azure',
+            'aws': 'Amazon',
+            'gcp': 'Google',
+            'baremetal': 'BareMetal',
+            'none': 'Other',
+        }
+        bm_pattern = re.compile(r'bare\s*metal|on[\s-]*prem', re.IGNORECASE)
+        for name, c in data.items():
+            if name == hub:
+                continue
+            if c.get('type', 'openshift') != 'openshift':
+                continue
+            safe = name.lower().replace(' ', '-')
+            safe = ''.join(ch if ch.isalnum() or ch == '-' else '' for ch in safe)
+            safe = safe.strip('-')
+            if bm_pattern.search(name):
+                cloud = 'BareMetal'
+            else:
+                platform = c.get('platform', 'unknown').lower()
+                cloud = platform_map.get(platform, 'Other')
+            print(f'{name}\t{safe}\t{c[\"api\"]}\t{c[\"user\"]}\t{c[\"password\"]}\t{cloud}')
+        ")
+
+        IMPORTED=0
+        SKIPPED=0
+        FAILED=0
+        TOTAL=0
+        STATUS_JSON='{"status":"running","clusters":{'
+        FIRST=true
+
+        while IFS=$'\t' read -r ORIG_NAME SAFE_NAME SPOKE_API SPOKE_USER SPOKE_PASS CLOUD_LABEL; do
+          [ -z "${ORIG_NAME}" ] && continue
+          TOTAL=$((TOTAL + 1))
+
+          echo ""
+          echo ">>> Processing cluster: ${ORIG_NAME} (${SAFE_NAME})"
+
+          # Update status: checking
+          if [ "${FIRST}" = true ]; then
+            STATUS_JSON="${STATUS_JSON}\"${ORIG_NAME}\":\"checking\""
+            FIRST=false
+          else
+            STATUS_JSON="${STATUS_JSON},\"${ORIG_NAME}\":\"checking\""
+          fi
+          update_status "${STATUS_JSON}}}"
+
+          # Re-login to hub before each check
+          oc login --insecure-skip-tls-verify -u "${HUB_USER}" -p "${HUB_PASS}" "${HUB_API}" > /dev/null 2>&1
+
+          # Check if ManagedCluster already exists and is healthy
+          if oc get managedcluster "${SAFE_NAME}" > /dev/null 2>&1; then
+            MC_AVAIL=$(oc get managedcluster "${SAFE_NAME}" -o jsonpath='{range .status.conditions[?(@.type=="ManagedClusterConditionAvailable")]}{.status}{end}' 2>/dev/null || echo "")
+            if [ "${MC_AVAIL}" = "True" ]; then
+              echo "  ${ORIG_NAME} already imported as ${SAFE_NAME}, healthy — skipping"
+              SKIPPED=$((SKIPPED + 1))
+              STATUS_JSON=$(echo "${STATUS_JSON}" | sed "s/\"${ORIG_NAME}\":\"checking\"/\"${ORIG_NAME}\":\"skipped\"/")
+              update_status "${STATUS_JSON}}}"
+              continue
+            fi
+            echo "  ${ORIG_NAME} exists as ${SAFE_NAME} but agent unavailable (status: ${MC_AVAIL:-empty}), re-importing..."
+            oc delete managedcluster "${SAFE_NAME}" --wait=false 2>/dev/null || true
+            oc delete namespace "${SAFE_NAME}" --wait=false 2>/dev/null || true
+            echo "  Waiting for ManagedCluster deletion..."
+            oc wait --for=delete managedcluster/"${SAFE_NAME}" --timeout=60s 2>/dev/null || true
+          fi
+
+          # Update status: importing
+          STATUS_JSON=$(echo "${STATUS_JSON}" | sed "s/\"${ORIG_NAME}\":\"checking\"/\"${ORIG_NAME}\":\"importing\"/")
+          update_status "${STATUS_JSON}}}"
+
+          # Log into spoke to get a token
+          echo "  Logging into spoke ${ORIG_NAME} at ${SPOKE_API}..."
+          if ! oc login --insecure-skip-tls-verify -u "${SPOKE_USER}" -p "${SPOKE_PASS}" "${SPOKE_API}" > /dev/null 2>&1; then
+            echo "  WARNING: Could not log into ${ORIG_NAME}, skipping"
+            FAILED=$((FAILED + 1))
+            STATUS_JSON=$(echo "${STATUS_JSON}" | sed "s/\"${ORIG_NAME}\":\"importing\"/\"${ORIG_NAME}\":\"failed\"/")
+            update_status "${STATUS_JSON}}}"
+            continue
+          fi
+          SPOKE_TOKEN=$(oc whoami -t)
+          SPOKE_SERVER=$(oc whoami --show-server)
+
+          # Switch back to hub
+          oc login --insecure-skip-tls-verify -u "${HUB_USER}" -p "${HUB_PASS}" "${HUB_API}" > /dev/null 2>&1
+
+          echo "  Creating namespace ${SAFE_NAME} on hub..."
+          oc create namespace "${SAFE_NAME}" --dry-run=client -o yaml | oc apply -f - 2>/dev/null || true
+
+          CLOUD="${CLOUD_LABEL:-Other}"
+          echo "  Creating ManagedCluster ${SAFE_NAME} (cloud: ${CLOUD})..."
+          cat <<MCYAML | oc apply -f -
+        apiVersion: cluster.open-cluster-management.io/v1
+        kind: ManagedCluster
+        metadata:
+          name: ${SAFE_NAME}
+          labels:
+            name: ${SAFE_NAME}
+            cloud: ${CLOUD}
+            vendor: OpenShift
+        spec:
+          hubAcceptsClient: true
+        MCYAML
+
+          echo "  Creating KlusterletAddonConfig..."
+          cat <<KACYAML | oc apply -f -
+        apiVersion: agent.open-cluster-management.io/v1
+        kind: KlusterletAddonConfig
+        metadata:
+          name: ${SAFE_NAME}
+          namespace: ${SAFE_NAME}
+        spec:
+          clusterName: ${SAFE_NAME}
+          clusterNamespace: ${SAFE_NAME}
+          clusterLabels:
+            cloud: auto-import
+            vendor: OpenShift
+          applicationManager:
+            enabled: true
+          policyController:
+            enabled: true
+          searchCollector:
+            enabled: true
+          certPolicyController:
+            enabled: true
+          iamPolicyController:
+            enabled: true
+        KACYAML
+
+          echo "  Creating auto-import-secret..."
+          cat <<AISYAML | oc apply -f -
+        apiVersion: v1
+        kind: Secret
+        metadata:
+          name: auto-import-secret
+          namespace: ${SAFE_NAME}
+        type: Opaque
+        stringData:
+          server: ${SPOKE_SERVER}
+          token: ${SPOKE_TOKEN}
+        AISYAML
+
+          echo "  ${ORIG_NAME} imported as ${SAFE_NAME}"
+          IMPORTED=$((IMPORTED + 1))
+          STATUS_JSON=$(echo "${STATUS_JSON}" | sed "s/\"${ORIG_NAME}\":\"importing\"/\"${ORIG_NAME}\":\"imported\"/")
+          update_status "${STATUS_JSON}}}"
+
+        done <<< "${SPOKES}"
+
+        SUMMARY="${IMPORTED} imported, ${SKIPPED} skipped, ${FAILED} failed out of ${TOTAL} clusters"
+        echo ""
+        echo ">>> ACM onboarding complete: ${SUMMARY}"
+
+        # Ensure the observability pull secret exists to silence warnings
+        echo ">>> Ensuring observability pull secret exists..."
+        oc login --insecure-skip-tls-verify -u "${HUB_USER}" -p "${HUB_PASS}" "${HUB_API}" > /dev/null 2>&1
+        if ! oc get secret multiclusterhub-operator-pull-secret -n open-cluster-management-observability > /dev/null 2>&1; then
+          oc create secret docker-registry multiclusterhub-operator-pull-secret \
+            --docker-server=registry.redhat.io --docker-username=unused --docker-password=unused \
+            -n open-cluster-management-observability 2>/dev/null && \
+            echo "    Created placeholder pull secret" || \
+            echo "    Observability namespace not found — skipping"
+        else
+          echo "    Pull secret already exists"
+        fi
+
+        if [ "${FAILED}" -gt 0 ]; then
+          FINAL_STATUS="failed"
+        else
+          FINAL_STATUS="complete"
+        fi
+        update_status $(echo "${STATUS_JSON}}}" | sed "s/\"running\"/\"${FINAL_STATUS}\"/")
+
+        printf "%s" "${SUMMARY}" > "$(results.summary.path)"
+---
+apiVersion: tekton.dev/v1
+kind: Task
+metadata:
+  name: dash-px-license-activate
+  annotations:
+    description: "Reads PX license key from dashboard config and cluster list from clusters Secret, logs into each cluster with Portworx, and activates the license via pxctl."
+spec:
+  params:
+    - name: namespace
+      type: string
+      default: "workload-portability-build"
+  results:
+    - name: summary
+      description: "Summary of license activation results"
+  steps:
+    - name: activate
+      image: image-registry.openshift-image-registry.svc:5000/openshift/cli:latest
+      script: |
+        #!/usr/bin/env bash
+        set -euo pipefail
+        NS="$(params.namespace)"
+        LOCAL_TOKEN=$(cat /var/run/secrets/kubernetes.io/serviceaccount/token)
+        LOCAL_API="https://${KUBERNETES_SERVICE_HOST}:${KUBERNETES_SERVICE_PORT}"
+        LOCAL_CA=/var/run/secrets/kubernetes.io/serviceaccount/ca.crt
+
+        echo ">>> Reading license key from dashboard config..."
+        CONFIG_JSON=$(oc get secret installation-dashboard-config -n "${NS}" \
+          --server="${LOCAL_API}" --token="${LOCAL_TOKEN}" --certificate-authority="${LOCAL_CA}" \
+          -o jsonpath='{.data.config}' | base64 -d)
+
+        PX_KEY=$(echo "${CONFIG_JSON}" | python3 -c "import json,sys; print(json.load(sys.stdin).get('pxLicenseKey',''))")
+        if [ -z "${PX_KEY}" ]; then
+          echo "ERROR: No Portworx license key configured in dashboard"
+          printf "No license key configured" > "$(results.summary.path)"
+          exit 1
+        fi
+        echo "License key found (${#PX_KEY} chars)"
+
+        echo ">>> Reading cluster data from Secret..."
+        CLUSTERS_JSON=$(oc get secret installation-dashboard-clusters -n "${NS}" \
+          --server="${LOCAL_API}" --token="${LOCAL_TOKEN}" --certificate-authority="${LOCAL_CA}" \
+          -o jsonpath='{.data.clusters}' | base64 -d)
+
+        echo ">>> Finding clusters with Portworx role..."
+        PX_CLUSTERS=$(echo "${CLUSTERS_JSON}" | python3 -c "
+        import json, sys
+        data = json.load(sys.stdin)
+        for name, c in data.items():
+            roles = c.get('assignedRoles', [])
+            if 'portworx' in roles and c.get('type', 'openshift') == 'openshift':
+                print(f'{name}\t{c[\"api\"]}\t{c[\"user\"]}\t{c[\"password\"]}')
+        ")
+
+        if [ -z "${PX_CLUSTERS}" ]; then
+          echo "No clusters with Portworx role found"
+          printf "No Portworx clusters found" > "$(results.summary.path)"
+          exit 0
+        fi
+
+        SUCCEEDED=0
+        SKIPPED=0
+        FAILED=0
+        SUMMARY=""
+
+        while IFS=$'\t' read -r NAME API USER PASS; do
+          echo ""
+          echo "────────────────────────────────────────"
+          echo "  Activating license on: ${NAME}"
+          echo "  API: ${API}"
+          echo "────────────────────────────────────────"
+
+          if ! oc login --insecure-skip-tls-verify -u "${USER}" -p "${PASS}" "${API}" > /dev/null 2>&1; then
+            echo "  SKIP: Failed to login to ${NAME}"
+            SKIPPED=$((SKIPPED + 1))
+            SUMMARY="${SUMMARY}${NAME}: login failed (skipped); "
+            continue
+          fi
+
+          PX_POD=$(oc get pods -n portworx -l name=portworx -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)
+          if [ -z "${PX_POD}" ]; then
+            echo "  SKIP: No Portworx pods on ${NAME} — StorageCluster not deployed yet"
+            SKIPPED=$((SKIPPED + 1))
+            SUMMARY="${SUMMARY}${NAME}: no px pods (skipped); "
+            continue
+          fi
+
+          LICENSE_STATUS=$(oc exec -n portworx "${PX_POD}" -c portworx -- \
+            /opt/pwx/bin/pxctl license list 2>&1 || true)
+          if echo "${LICENSE_STATUS}" | grep -qi "saas\|enterprise"; then
+            echo "  SKIP: License already active on ${NAME}"
+            SKIPPED=$((SKIPPED + 1))
+            SUMMARY="${SUMMARY}${NAME}: already licensed (skipped); "
+            continue
+          fi
+
+          echo "  Exec into ${PX_POD}..."
+          if OUTPUT=$(oc exec -n portworx "${PX_POD}" -c portworx -- \
+            /opt/pwx/bin/pxctl license activate saas --key "${PX_KEY}" 2>&1); then
+            echo "  SUCCESS: ${OUTPUT}"
+            SUCCEEDED=$((SUCCEEDED + 1))
+            SUMMARY="${SUMMARY}${NAME}: ok; "
+          else
+            echo "  ERROR: ${OUTPUT}"
+            FAILED=$((FAILED + 1))
+            SUMMARY="${SUMMARY}${NAME}: failed; "
+          fi
+        done <<< "${PX_CLUSTERS}"
+
+        echo ""
+        echo ">>> Done: ${SUCCEEDED} succeeded, ${SKIPPED} skipped, ${FAILED} failed"
+        printf "%s" "${SUCCEEDED} succeeded, ${SKIPPED} skipped, ${FAILED} failed. ${SUMMARY}" > "$(results.summary.path)"
+
+        if [ "${FAILED}" -gt 0 ]; then
+          exit 1
+        fi
+---
+apiVersion: tekton.dev/v1
+kind: Task
+metadata:
+  name: create-ocp-providers
+  annotations:
+    description: >-
+      Creates MTV OpenShift providers for clusters with the virt role assigned.
+      Idempotent — safe to re-run. Cleans up stale providers, creates a service
+      account on each remote cluster, generates a fresh token, and creates the
+      provider in the MTV namespace.
+spec:
+  params:
+    - name: namespace
+      type: string
+      default: "workload-portability-build"
+    - name: clusters-secret
+      type: string
+      default: "installation-dashboard-clusters"
+    - name: mtv-namespace
+      type: string
+      default: "openshift-mtv"
+  results:
+    - name: summary
+      description: "Summary of providers created"
+  steps:
+    - name: create-providers
+      image: image-registry.openshift-image-registry.svc:5000/openshift/cli:latest
+      script: |
+        #!/usr/bin/env bash
+        set -uo pipefail
+        NS="$(params.namespace)"
+        SECRET="$(params.clusters-secret)"
+        MTV_NS="$(params.mtv-namespace)"
+        SA_NAME="forklift-migration"
+        LABEL_KEY="app.kubernetes.io/managed-by"
+        LABEL_VALUE="installation-dashboard"
+        LABEL="${LABEL_KEY}=${LABEL_VALUE}"
+
+        echo "==================================================="
+        echo "  CREATE OPENSHIFT PROVIDERS FOR MTV"
+        echo "==================================================="
+        echo ""
+
+        # 1. Read clusters secret
+        echo "[PROV] Reading clusters from secret ${SECRET}..."
+        CLUSTERS_B64=$(oc get secret "${SECRET}" -n "${NS}" -o jsonpath='{.data.clusters}' 2>&1) || {
+            echo "[FAIL] Could not read clusters secret: ${CLUSTERS_B64}"
+            exit 1
+        }
+
+        CLUSTERS_JSON=$(echo "${CLUSTERS_B64}" | base64 -d)
+
+        # 2. Get local cluster API to skip it (already has "host" provider)
+        LOCAL_API="https://${KUBERNETES_SERVICE_HOST}:${KUBERNETES_SERVICE_PORT}"
+        echo "[PROV] Local cluster API: ${LOCAL_API}"
+
+        # 3. Parse OpenShift clusters
+        CLUSTER_LIST=$(echo "${CLUSTERS_JSON}" | python3 -c "
+        import sys, json
+        clusters = json.load(sys.stdin)
+        for name, c in clusters.items():
+            if c.get('type', 'openshift') == 'openshift' and 'virt' in c.get('assignedRoles', []):
+                api = c.get('api', '').rstrip('/')
+                user = c.get('user', '')
+                password = c.get('password', '')
+                print(f'{name}|{api}|{user}|{password}')
+        ")
+
+        if [ -z "${CLUSTER_LIST}" ]; then
+            echo "[PROV] No OpenShift clusters with virt role found in config"
+            printf "No clusters with virt role" > "$(results.summary.path)"
+            exit 0
+        fi
+
+        # 4. Clean up stale managed providers (not "host", not "legacy infrastructure")
+        echo "[PROV] Cleaning up stale managed providers..."
+        EXISTING=$(oc get providers -n "${MTV_NS}" -l "${LABEL}" -o jsonpath='{.items[*].metadata.name}' 2>/dev/null || true)
+        for P in ${EXISTING}; do
+            echo "[PROV]   Deleting provider ${P}..."
+            oc delete provider "${P}" -n "${MTV_NS}" --ignore-not-found=true 2>/dev/null || true
+            oc delete secret "mtv-provider-${P}" -n "${MTV_NS}" --ignore-not-found=true 2>/dev/null || true
+        done
+
+        # 5. Write cluster list to file so we can loop without a subshell
+        CLUSTER_FILE="/tmp/cluster-list.txt"
+        echo "${CLUSTER_LIST}" > "${CLUSTER_FILE}"
+        CREATED=0
+        SKIPPED=0
+        FAILED=0
+        SUMMARY=""
+        LOCAL_CLEAN=$(echo "${LOCAL_API}" | sed 's|/$||')
+        SA_NS="default"
+
+        while IFS='|' read -r NAME API USER PASSWORD; do
+            [ -z "${NAME}" ] && continue
+
+            echo ""
+            echo "--- ${NAME} ---"
+            echo "[PROV] API: ${API}"
+
+            # Skip local cluster
+            API_CLEAN=$(echo "${API}" | sed 's|/$||')
+            if [ "${API_CLEAN}" = "${LOCAL_CLEAN}" ]; then
+                echo "[PROV] SKIP: Local cluster (already has 'host' provider)"
+                SKIPPED=$((SKIPPED + 1))
+                continue
+            fi
+
+            # Login to remote cluster with temp kubeconfig
+            REMOTE_KC="/tmp/kubeconfig-${NAME}"
+            export KUBECONFIG="${REMOTE_KC}"
+
+            echo "[PROV] Logging in as ${USER}..."
+            if ! oc login "${API}" --username="${USER}" --password="${PASSWORD}" --insecure-skip-tls-verify=true 2>&1 | sed 's/^/  /'; then
+                echo "[FAIL] Could not login to ${NAME}"
+                FAILED=$((FAILED + 1))
+                SUMMARY="${SUMMARY} ${NAME}:login-failed"
+                unset KUBECONFIG
+                rm -f "${REMOTE_KC}"
+                continue
+            fi
+
+            # Create SA on remote cluster in default ns (always exists)
+            echo "[PROV] Ensuring service account ${SA_NAME} on ${NAME}..."
+            cat <<YAML | oc apply -f - 2>&1 | sed 's/^/  /'
+        apiVersion: v1
+        kind: ServiceAccount
+        metadata:
+          name: ${SA_NAME}
+          namespace: ${SA_NS}
+          labels:
+            ${LABEL_KEY}: ${LABEL_VALUE}
+        YAML
+
+            # Bind cluster-admin (idempotent)
+            oc adm policy add-cluster-role-to-user cluster-admin -z "${SA_NAME}" -n "${SA_NS}" 2>&1 | sed 's/^/  /'
+
+            # Generate fresh token (1 year)
+            echo "[PROV] Generating token..."
+            TOKEN=$(oc create token "${SA_NAME}" -n "${SA_NS}" --duration=8760h 2>&1)
+            if [ $? -ne 0 ] || [ -z "${TOKEN}" ]; then
+                echo "[FAIL] Could not create token on ${NAME}: ${TOKEN}"
+                FAILED=$((FAILED + 1))
+                SUMMARY="${SUMMARY} ${NAME}:token-failed"
+                unset KUBECONFIG
+                rm -f "${REMOTE_KC}"
+                continue
+            fi
+            echo "[PROV] Token generated (${#TOKEN} chars)"
+
+            # Switch back to local cluster
+            unset KUBECONFIG
+            rm -f "${REMOTE_KC}"
+
+            # Create secret on local cluster
+            PROVIDER_SECRET="mtv-provider-${NAME}"
+            echo "[PROV] Creating secret ${PROVIDER_SECRET}..."
+            cat <<YAML | oc apply -f - 2>&1 | sed 's/^/  /'
+        apiVersion: v1
+        kind: Secret
+        metadata:
+          name: ${PROVIDER_SECRET}
+          namespace: ${MTV_NS}
+          labels:
+            ${LABEL_KEY}: ${LABEL_VALUE}
+        type: Opaque
+        stringData:
+          token: ${TOKEN}
+          insecureSkipVerify: "true"
+        YAML
+
+            # Create provider on local cluster
+            echo "[PROV] Creating provider ${NAME}..."
+            cat <<YAML | oc apply -f - 2>&1 | sed 's/^/  /'
+        apiVersion: forklift.konveyor.io/v1beta1
+        kind: Provider
+        metadata:
+          name: ${NAME}
+          namespace: ${MTV_NS}
+          labels:
+            ${LABEL_KEY}: ${LABEL_VALUE}
+        spec:
+          type: openshift
+          url: ${API}
+          secret:
+            name: ${PROVIDER_SECRET}
+            namespace: ${MTV_NS}
+        YAML
+
+            CREATED=$((CREATED + 1))
+            SUMMARY="${SUMMARY} ${NAME}:ok"
+            echo "[PROV] ${NAME} provider created"
+        done < "${CLUSTER_FILE}"
+
+        echo ""
+        echo "==================================================="
+        echo "  PROVIDERS COMPLETE"
+        echo "  Created: ${CREATED}  Skipped: ${SKIPPED}  Failed: ${FAILED}"
+        echo "==================================================="
+        printf "%s" "${CREATED} created, ${SKIPPED} skipped, ${FAILED} failed.${SUMMARY}" > "$(results.summary.path)"
+
+        if [ "${FAILED}" -gt 0 ]; then
+          exit 1
+        fi
+---
+apiVersion: tekton.dev/v1
+kind: Task
+metadata:
+  name: create-mtv-target-routes
+  annotations:
+    description: >-
+      Reads clusters from the installation-dashboard-clusters secret, derives
+      the apps domain from each non-Legacy Infra cluster's API URL, logs into each
+      cluster, and creates routes for ALL clusters in portable-workload so
+      Portworx namespace migration carries routes to every destination.
+      Idempotent — safe to re-run.
+spec:
+  params:
+    - name: namespace
+      type: string
+      default: "workload-portability-build"
+    - name: clusters-secret
+      type: string
+      default: "installation-dashboard-clusters"
+    - name: target-namespace
+      type: string
+      default: "portable-workload"
+  results:
+    - name: summary
+      description: "Summary of routes created"
+  steps:
+    - name: create-routes
+      image: image-registry.openshift-image-registry.svc:5000/openshift/cli:latest
+      script: |
+        #!/usr/bin/env bash
+        set -uo pipefail
+        NS="$(params.namespace)"
+        SECRET="$(params.clusters-secret)"
+        TARGET_NS="$(params.target-namespace)"
+        LOCAL_TOKEN=$(cat /var/run/secrets/kubernetes.io/serviceaccount/token)
+        LOCAL_API="https://${KUBERNETES_SERVICE_HOST}:${KUBERNETES_SERVICE_PORT}"
+        LOCAL_CA=/var/run/secrets/kubernetes.io/serviceaccount/ca.crt
+
+        echo "==================================================="
+        echo "  CREATE MTV TARGET ROUTES"
+        echo "==================================================="
+        echo ""
+
+        # 1. Read clusters secret from the build cluster
+        echo "[ROUTE] Reading clusters from secret ${SECRET}..."
+        CLUSTERS_B64=$(oc get secret "${SECRET}" -n "${NS}" \
+          --server="${LOCAL_API}" --token="${LOCAL_TOKEN}" --certificate-authority="${LOCAL_CA}" \
+          -o jsonpath='{.data.clusters}' 2>&1) || {
+            echo "[FAIL] Could not read clusters secret: ${CLUSTERS_B64}"
+            exit 1
+        }
+
+        CLUSTERS_JSON=$(echo "${CLUSTERS_B64}" | base64 -d)
+
+        # 2. Parse ALL OpenShift clusters with credentials
+        ALL_CLUSTERS=$(echo "${CLUSTERS_JSON}" | python3 -c "
+        import sys, json
+        clusters = json.load(sys.stdin)
+        for name, c in sorted(clusters.items()):
+            if c.get('type', 'openshift') == 'legacy':
+                continue
+            api = c.get('api', '')
+            user = c.get('user', '')
+            password = c.get('password', '')
+            print(f'{name}|{api}|{user}|{password}')
+        ")
+
+        # 3. Parse only MTV clusters (clusters to log into)
+        CLUSTER_LIST=$(echo "${CLUSTERS_JSON}" | python3 -c "
+        import sys, json
+        clusters = json.load(sys.stdin)
+        for name, c in sorted(clusters.items()):
+            if c.get('type', 'openshift') == 'legacy':
+                continue
+            if 'mtv' not in c.get('assignedRoles', []):
+                continue
+            api = c.get('api', '')
+            user = c.get('user', '')
+            password = c.get('password', '')
+            print(f'{name}|{api}|{user}|{password}')
+        ")
+
+        if [ -z "${CLUSTER_LIST}" ]; then
+            echo "[ROUTE] No clusters with MTV role found"
+            printf "No MTV clusters found" > "$(results.summary.path)"
+            exit 0
+        fi
+
+        # 4. Query each cluster's real apps domain and build route definitions
+        ROUTE_FILE="/tmp/all-routes.txt"
+        CLUSTER_FILE="/tmp/cluster-list.txt"
+        echo "${CLUSTER_LIST}" > "${CLUSTER_FILE}"
+
+        > "${ROUTE_FILE}"
+        echo "${ALL_CLUSTERS}" | while IFS='|' read -r NAME API USER PASS; do
+            [ -z "${NAME}" ] && continue
+            APPS_DOMAIN=""
+            if oc login --insecure-skip-tls-verify -u "${USER}" -p "${PASS}" "${API}" > /dev/null 2>&1; then
+                APPS_DOMAIN=$(oc get ingresses.config.openshift.io cluster -o jsonpath='{.spec.domain}' 2>/dev/null || echo "")
+            fi
+            if [ -z "${APPS_DOMAIN}" ]; then
+                APPS_DOMAIN=$(echo "${API}" | python3 -c "from urllib.parse import urlparse; import re,sys; print(re.sub(r'^api\.', 'apps.', urlparse(sys.stdin.read().strip()).hostname or ''))")
+                echo "[ROUTE] WARNING: Could not query ${NAME}, falling back to: ${APPS_DOMAIN}"
+            else
+                echo "[ROUTE] ${NAME}: ${APPS_DOMAIN}"
+            fi
+            echo "${NAME}|portable-workload-vm-${NAME}|portable-workload-vm.${APPS_DOMAIN}" >> "${ROUTE_FILE}"
+        done
+
+        echo "[ROUTE] Routes to create on each cluster:"
+        cat "${ROUTE_FILE}" | while IFS='|' read -r _ RNAME RHOST; do
+            echo "  ${RNAME} -> ${RHOST}"
+        done
+
+        # 5. Log into each MTV cluster and create ALL routes
+        CLUSTERS_OK=0
+        CLUSTERS_FAIL=0
+        TOTAL_CREATED=0
+        TOTAL_FAILED=0
+
+        while IFS='|' read -r NAME API USER PASS APPS_DOMAIN; do
+            [ -z "${NAME}" ] && continue
+
+            echo ""
+            echo "==========================================="
+            echo "  Cluster: ${NAME}"
+            echo "==========================================="
+
+            echo "[ROUTE] Logging into ${NAME} at ${API}..."
+            if ! oc login --insecure-skip-tls-verify -u "${USER}" -p "${PASS}" "${API}" > /dev/null 2>&1; then
+                echo "[FAIL] Could not log into ${NAME}, skipping"
+                CLUSTERS_FAIL=$((CLUSTERS_FAIL + 1))
+                continue
+            fi
+
+            # Ensure target namespace exists on this cluster
+            if ! oc get namespace "${TARGET_NS}" > /dev/null 2>&1; then
+                echo "[ROUTE] Creating namespace ${TARGET_NS} on ${NAME}..."
+                oc create namespace "${TARGET_NS}" 2>&1 || true
+            fi
+
+            # Create all routes on this cluster
+            while IFS='|' read -r CNAME ROUTE_NAME ROUTE_HOST; do
+                [ -z "${CNAME}" ] && continue
+
+                if cat <<YAML | oc apply -f - 2>&1 | sed 's/^/    /'; then
+        apiVersion: route.openshift.io/v1
+        kind: Route
+        metadata:
+          name: ${ROUTE_NAME}
+          namespace: ${TARGET_NS}
+          labels:
+            app: portable-workload
+            app.kubernetes.io/managed-by: installation-dashboard
+        spec:
+          host: ${ROUTE_HOST}
+          to:
+            kind: Service
+            name: pw-frontend-svc
+          port:
+            targetPort: http
+          tls:
+            termination: edge
+            insecureEdgeTerminationPolicy: Redirect
+        YAML
+                    TOTAL_CREATED=$((TOTAL_CREATED + 1))
+                    echo "  [OK] ${ROUTE_NAME}"
+                else
+                    TOTAL_FAILED=$((TOTAL_FAILED + 1))
+                    echo "  [FAIL] ${ROUTE_NAME}"
+                fi
+            done < "${ROUTE_FILE}"
+
+            CLUSTERS_OK=$((CLUSTERS_OK + 1))
+            echo "[ROUTE] ${NAME} done"
+        done < "${CLUSTER_FILE}"
+
+        echo ""
+        echo "==================================================="
+        echo "  ROUTES COMPLETE"
+        echo "  Clusters: ${CLUSTERS_OK} ok, ${CLUSTERS_FAIL} failed"
+        echo "  Routes: ${TOTAL_CREATED} created, ${TOTAL_FAILED} failed"
+        echo "==================================================="
+        printf "%s" "${CLUSTERS_OK} clusters, ${TOTAL_CREATED} routes created, ${TOTAL_FAILED} failed" > "$(results.summary.path)"
+
+        if [ "${TOTAL_FAILED}" -gt 0 ]; then
+          exit 1
+        fi

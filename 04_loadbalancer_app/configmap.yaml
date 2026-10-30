@@ -1,0 +1,42 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: faux-lb-config
+data:
+  config.yaml: |
+    # ───────────────────────────────────────────────────────────────
+    #  APPLICATION LOAD BALANCER — configuration
+    #
+    #  Add / remove nodes here. The dashboard updates LIVE when you
+    #  save this file (no restart needed) — a new entry = a new node.
+    #
+    #  Fields per node:
+    #    name     : label shown under the icon (use \n for line breaks)
+    #    position : sequential order, left → right (1,2,3,4,5...)
+    #    icon     : vm | cloud | baremetal   (picks the drawing)
+    #    url      : the real backend target URL
+    # ───────────────────────────────────────────────────────────────
+
+    title: Application LB
+
+    # Which position is "live" when the server first starts.
+    initialActive: 1
+
+    # The domain shown on the dashboard (should match hosts.sh / /etc/hosts).
+    domain: portable-workload.example.com
+
+    nodes:
+      - name: Legacy VM
+        position: 1
+        icon: vm
+        url: http://app.legacy-infra.example.com/
+
+      - name: "OpenShift\nOn-Premise"
+        position: 2
+        icon: baremetal
+        url: https://app.apps.ocp-onprem.example.com/
+
+      - name: "Cloud\nManaged Cluster"
+        position: 3
+        icon: cloud
+        url: https://app.apps.cloud-cluster.example.com/

@@ -1,0 +1,32 @@
+apiVersion: tekton.dev/v1
+kind: Pipeline
+metadata:
+  name: 7-create-ocp-providers
+  annotations:
+    description: >-
+      Creates MTV OpenShift providers for clusters with the virt role assigned.
+      Idempotent — cleans up stale providers, creates a service account with
+      cluster-admin on each remote cluster, generates a fresh token, and
+      creates the Provider CR in the MTV namespace.
+    dependencies: "MTV operator must be installed (pipeline assigns mtv role)"
+spec:
+  description: >-
+    OCP Provider pipeline:
+    1. Clean up stale managed providers
+    2. Login to each remote cluster
+    3. Create service account + cluster-admin binding
+    4. Generate long-lived token
+    5. Create Provider secret + CR in openshift-mtv
+  params:
+    - name: namespace
+      type: string
+      description: Build namespace
+      default: "workload-portability-build"
+
+  tasks:
+    - name: create-ocp-providers
+      taskRef:
+        name: create-ocp-providers
+      params:
+        - name: namespace
+          value: $(params.namespace)
